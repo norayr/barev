@@ -30,8 +30,8 @@
 #include "internal.h"
 #include "jabber.h"
 
-#define BONJOUR_GROUP_NAME _("Bonjour")
-#define BONJOUR_PROTOCOL_NAME "bonjour"
+#define BONJOUR_GROUP_NAME _("Barev")
+#define BONJOUR_PROTOCOL_NAME "barev"
 #define BONJOUR_ICON_NAME "bonjour"
 
 #define BONJOUR_STATUS_ID_OFFLINE   "offline"
@@ -42,10 +42,10 @@
 
 typedef struct _BonjourData
 {
-	BonjourDnsSd *dns_sd_data;
-	BonjourJabber *jabber_data;
-	GSList *xfer_lists;
-	gchar *jid;
+  BonjourDnsSd *dns_sd_data;
+  BonjourJabber *jabber_data;
+  GSList *xfer_lists;
+  gchar *jid;
 } BonjourData;
 
 /**

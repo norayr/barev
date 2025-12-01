@@ -25,7 +25,7 @@ CFLAGS += $(WARN) $(PICFLAG) \
 
 LDLIBS  = $(PURPLE_LIBS) $(GLIB_LIBS) $(LIBXML_LIBS) $(AVAHI_LIBS)
 
-PLUGIN  = libbonjour.so
+PLUGIN  = libbarev.so
 
 SRCS = \
   bonjour.c \

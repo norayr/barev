@@ -35,36 +35,36 @@
 
 typedef struct _BonjourJabber
 {
-	gint port;
-	gint socket;
-	gint socket6;
-	gint watcher_id;
-	gint watcher_id6;
-	PurpleAccount *account;
-	GSList *pending_conversations;
+  gint port;
+  gint socket;
+  gint socket6;
+  gint watcher_id;
+  gint watcher_id6;
+  PurpleAccount *account;
+  GSList *pending_conversations;
 } BonjourJabber;
 
 typedef struct _BonjourJabberConversation
 {
-	gint socket;
-	guint rx_handler;
-	guint tx_handler;
-	guint close_timeout;
-	PurpleCircBuffer *tx_buf;
-	int sent_stream_start; /* 0 = Unsent, 1 = Partial, 2 = Complete */
-	gboolean recv_stream_start;
-	PurpleProxyConnectData *connect_data;
-	gpointer stream_data;
-	xmlParserCtxt *context;
-	xmlnode *current;
-	PurpleBuddy *pb;
-	PurpleAccount *account;
+  gint socket;
+  guint rx_handler;
+  guint tx_handler;
+  guint close_timeout;
+  PurpleCircBuffer *tx_buf;
+  int sent_stream_start; /* 0 = Unsent, 1 = Partial, 2 = Complete */
+  gboolean recv_stream_start;
+  PurpleProxyConnectData *connect_data;
+  gpointer stream_data;
+  xmlParserCtxt *context;
+  xmlnode *current;
+  PurpleBuddy *pb;
+  PurpleAccount *account;
 
-	/* The following are only needed before attaching to a PurpleBuddy */
-	gchar *buddy_name;
-	gchar *ip;
-	/* This points to a data entry in BonjourBuddy->ips */
-	const gchar *ip_link;
+  /* The following are only needed before attaching to a PurpleBuddy */
+  gchar *buddy_name;
+  gchar *ip;
+  /* This points to a data entry in BonjourBuddy->ips */
+  const gchar *ip_link;
 } BonjourJabberConversation;
 
 /**
@@ -92,24 +92,27 @@ void bonjour_jabber_conv_match_by_ip(BonjourJabberConversation *bconv);
 void bonjour_jabber_conv_match_by_name(BonjourJabberConversation *bconv);
 
 typedef enum {
-	XEP_IQ_SET,
-	XEP_IQ_GET,
-	XEP_IQ_RESULT,
-	XEP_IQ_ERROR,
-	XEP_IQ_NONE
+  XEP_IQ_SET,
+  XEP_IQ_GET,
+  XEP_IQ_RESULT,
+  XEP_IQ_ERROR,
+  XEP_IQ_NONE
 } XepIqType;
 
 typedef struct _XepIq {
-	XepIqType type;
-	char *id;
-	xmlnode *node;
-	char *to;
-	void *data;
+  XepIqType type;
+  char *id;
+  xmlnode *node;
+  char *to;
+  void *data;
 } XepIq;
 
 XepIq *xep_iq_new(void *data, XepIqType type, const char *to, const char *from, const char *id);
 int xep_iq_send_and_free(XepIq *iq);
 GSList * bonjour_jabber_get_local_ips(int fd);
+
+int bonjour_jabber_open_stream(BonjourJabber *jdata, const char *to);
+
 
 void append_iface_if_linklocal(char *ip, guint32 interface_param);
 

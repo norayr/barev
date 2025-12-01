@@ -46,6 +46,7 @@ typedef struct _BonjourData
   BonjourJabber *jabber_data;
   GSList *xfer_lists;
   gchar *jid;
+  guint reconnect_timer; // barev reconnect timer
 } BonjourData;
 
 /**

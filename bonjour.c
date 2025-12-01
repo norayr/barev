@@ -45,11 +45,80 @@
 #include "bonjour_ft.h"
 
 #include "request.h" //for purple_request_fields
+#include "libpurple/blist.h" // for barev
+#include "eventloop.h"
+
 
 typedef struct {
   PurpleConnection *pc;
   PurpleBuddy *buddy;
 } BarevAddBuddyData;
+
+
+static gboolean barev_should_autoconnect_buddy(PurpleBuddy *buddy)
+{
+    BonjourBuddy *bb = purple_buddy_get_protocol_data(buddy);
+
+    if (!bb)
+        return FALSE;
+
+    /* Only manual Barev buddies: we require an IP and no active conv */
+    if (!bb->ips)
+        return FALSE;
+
+    if (bb->conversation != NULL)
+        return FALSE; /* already connected */
+
+    return TRUE;
+}
+
+static gboolean
+barev_reconnect_cb(gpointer data)
+{
+    PurpleConnection *gc = data;
+    PurpleAccount *account;
+    BonjourData *bd;
+    PurpleBlistNode *node;
+
+    if (!gc)
+        return FALSE;
+
+    account = purple_connection_get_account(gc);
+    bd = gc->proto_data;
+
+    if (!account || !bd || !bd->jabber_data)
+        return FALSE; /* stop timer */
+
+    for (node = purple_blist_get_root(); node;
+         node = purple_blist_node_next(node, FALSE)) {
+
+        if (!PURPLE_BLIST_NODE_IS_BUDDY(node))
+            continue;
+
+        PurpleBuddy *buddy = (PurpleBuddy *)node;
+        if (purple_buddy_get_account(buddy) != account)
+            continue;
+
+        if (!barev_should_autoconnect_buddy(buddy))
+            continue;
+
+        BonjourBuddy *bb = purple_buddy_get_protocol_data(buddy);
+        if (!bb || !bb->ips)
+            continue;
+
+        purple_debug_info("bonjour", "Barev: auto-connecting to %s\n",
+                          purple_buddy_get_name(buddy));
+
+        /* Try to open / re-open the stream */
+        bonjour_jabber_open_stream(bd->jabber_data, bb->name);
+        /* Result of connect (success/fail) will be reflected later via
+         * bonjour_jabber_stream_started / close_conversation
+         * updating the status.
+         */
+    }
+
+    return TRUE; /* keep timer */
+}
 
 
 static gchar * barev_contacts_filename(PurpleAccount *account)
@@ -315,27 +384,25 @@ bonjour_login(PurpleAccount *account)
   bd->jabber_data = g_new0(BonjourJabber, 1);
   bd->jabber_data->socket = -1;
   bd->jabber_data->socket6 = -1;
-  bd->jabber_data->port = purple_account_get_int(account, "port", BONJOUR_DEFAULT_PORT);
+  bd->jabber_data->port =
+      purple_account_get_int(account, "port", BONJOUR_DEFAULT_PORT);
   bd->jabber_data->account = account;
 
   if (bonjour_jabber_start(bd->jabber_data) == -1) {
-    /* Send a message about the connection error */
-    purple_connection_error_reason (gc,
+    purple_connection_error_reason(gc,
         PURPLE_CONNECTION_ERROR_NETWORK_ERROR,
         _("Unable to listen for incoming IM connections"));
     return;
   }
 
-    //if (bonjour_jabber_start(bd->jabber_data) == -1) {
-    //  /* existing error handling */
-    //  purple_connection_error_reason(gc,
-    //                                 PURPLE_CONNECTION_ERROR_NETWORK_ERROR,
-    //                                 _("Unable to listen for incoming IM connections"));
-    //  return;
-    //}
+  /* Load Barev manual contacts (no mDNS) */
+  barev_load_contacts(account);
 
-    /* load barev manual contacts */
-    barev_load_contacts(account);
+  /* Start periodic reconnect attempts for Barev contacts */
+  bd->reconnect_timer = purple_timeout_add_seconds(
+      30,                 /* or 10, or whatever you like */
+      barev_reconnect_cb,
+      gc);
 
 
   /* Connect to the mDNS daemon looking for buddies in the LAN */
@@ -399,6 +466,12 @@ bonjour_close(PurpleConnection *connection)
     bonjour_jabber_stop(bd->jabber_data);
     g_free(bd->jabber_data);
   }
+
+    if (bd != NULL && bd->reconnect_timer != 0) {
+      purple_timeout_remove(bd->reconnect_timer);
+      bd->reconnect_timer = 0;
+  }
+
 
   /* Delete the bonjour group
    * (purple_blist_remove_group will bail out if the group isn't empty)

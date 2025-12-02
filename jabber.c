@@ -85,6 +85,76 @@ enum sent_stream_start_types {
 static void
 xep_iq_parse(xmlnode *packet, PurpleBuddy *pb);
 
+/* Barev/XEP-0174 helper:
+ * Match "localpart@whatever" to a buddy whose name starts with "localpart@".
+ * This lets us treat "inky@barev.local" the same as "inky@201:..." as long as
+ * the nick ("inky") is the same.
+ */
+static PurpleBuddy *
+bonjour_find_buddy_by_localpart(PurpleAccount *account, const char *jid)
+{
+    const char *at;
+    gchar *local = NULL;
+    PurpleBlistNode *gnode, *cnode, *bnode;
+    PurpleBuddy *buddy = NULL;
+
+    if (!account || !jid)
+        return NULL;
+
+    at = strchr(jid, '@');
+    if (!at || at == jid)
+        return NULL;
+
+    /* local = "inky" for "inky@barev.local" */
+    local = g_strndup(jid, (gsize)(at - jid));
+    if (!local)
+        return NULL;
+
+    for (gnode = purple_blist_get_root(); gnode; gnode = gnode->next) {
+        if (!PURPLE_BLIST_NODE_IS_GROUP(gnode))
+            continue;
+
+        for (cnode = gnode->child; cnode; cnode = cnode->next) {
+            if (!PURPLE_BLIST_NODE_IS_CONTACT(cnode))
+                continue;
+
+            for (bnode = cnode->child; bnode; bnode = bnode->next) {
+                const char *name;
+
+                if (!PURPLE_BLIST_NODE_IS_BUDDY(bnode))
+                    continue;
+
+                buddy = (PurpleBuddy *)bnode;
+
+                if (purple_buddy_get_account(buddy) != account)
+                    continue;
+
+                name = purple_buddy_get_name(buddy);
+                if (!name)
+                    continue;
+
+                /* Look for "local@" prefix, e.g. "inky@" */
+                if (g_str_has_prefix(name, local) &&
+                    name[strlen(local)] == '@') {
+
+                    purple_debug_info("bonjour",
+                        "bonjour_find_buddy_by_localpart: '%s' -> '%s'\n",
+                        jid, name);
+
+                    g_free(local);
+                    return buddy;
+                }
+            }
+        }
+    }
+
+    g_free(local);
+    return NULL;
+}
+
+
+
+
 
 static BonjourJabberConversation *
 bonjour_jabber_conv_new(PurpleBuddy *pb, PurpleAccount *account, const char *ip) {
@@ -946,61 +1016,102 @@ _connected_to_buddy(gpointer data, gint source, const gchar *error)
   bb->conversation->rx_handler = purple_input_add(source,
     PURPLE_INPUT_READ, _client_socket_handler, bb->conversation);
 }
-
 void
 bonjour_jabber_conv_match_by_name(BonjourJabberConversation *bconv)
 {
-    PurpleBuddy *pb = NULL;
-    BonjourBuddy *bb = NULL;
-    BonjourJabber *jdata;
+    PurpleBuddy     *pb     = NULL;
+    BonjourBuddy    *bb     = NULL;
+    BonjourJabber   *jdata  = NULL;
+    PurpleAccount   *account;
 
+    g_return_if_fail(bconv != NULL);
     g_return_if_fail(bconv->ip != NULL);
 
-    /* If we already matched this conversation to a buddy (e.g. by IP),
-     * there is nothing more to do.
-     */
-    if (bconv->pb != NULL)
+    account = bconv->account;
+    if (!account || !account->gc || !account->gc->proto_data) {
+        purple_debug_error("bonjour",
+                           "conv_match_by_name: missing account or connection\n");
         return;
-
-    if (bconv->buddy_name) {
-        pb = purple_find_buddy(bconv->account, bconv->buddy_name);
     }
 
-    if (pb && (bb = purple_buddy_get_protocol_data(pb))) {
-        jdata = ((BonjourData*) bconv->account->gc->proto_data)->jabber_data;
+    jdata = ((BonjourData*) account->gc->proto_data)->jabber_data;
+    if (!jdata) {
+        purple_debug_error("bonjour",
+                           "conv_match_by_name: no jabber_data\n");
+        return;
+    }
 
+    /* If we have no buddy_name at all, we can only try IP matching. */
+    if (!bconv->buddy_name) {
         purple_debug_info("bonjour",
-            "Matched buddy %s to incoming conversation \"from\" attrib "
-            "(buddy_name=%s, conv IP=%s)\n",
-            purple_buddy_get_name(pb),
-            bconv->buddy_name ? bconv->buddy_name : "(null)",
-            bconv->ip ? bconv->ip : "(null)");
-
-        /* Attach conv. to buddy and remove from pending list */
-        jdata->pending_conversations =
-            g_slist_remove(jdata->pending_conversations, bconv);
-
-        /* If the buddy already has a conversation, replace it */
-        if (bb->conversation != NULL && bb->conversation != bconv)
-            bonjour_jabber_close_conversation(bb->conversation);
-
-        bconv->pb = pb;
-        bb->conversation = bconv;
+                          "conv_match_by_name: buddy_name is NULL, trying IP match only\n");
+        bonjour_jabber_conv_match_by_ip(bconv);
         return;
     }
 
-    /* No buddy by name – try matching by IP instead. */
-    purple_debug_warning("bonjour",
-        "conv_match_by_name: no buddy named \"%s\"; trying IP match for %s\n",
-        bconv->buddy_name ? bconv->buddy_name : "(null)",
-        bconv->ip ? bconv->ip : "(no ip)");
+    /* 1) Try exact name match first (e.g. "inky@201:...") */
+    pb = purple_find_buddy(account, bconv->buddy_name);
+    if (!pb) {
+        purple_debug_info("bonjour",
+                          "conv_match_by_name: no buddy named '%s'\n",
+                          bconv->buddy_name);
 
-    bonjour_jabber_conv_match_by_ip(bconv);
+        /* 2) Barev-style fallback: match by localpart ("inky@barev.local" -> "inky@201:...") */
+        pb = bonjour_find_buddy_by_localpart(account, bconv->buddy_name);
+        if (!pb) {
+            purple_debug_info("bonjour",
+                              "conv_match_by_name: no buddy with localpart of '%s'\n",
+                              bconv->buddy_name);
 
-    /* IMPORTANT: Do NOT close the conversation here if still unmatched.
-     * We keep the stream open so that Barev can still talk to unknown peers,
-     * or we might match later using IP or additional information.
-     */
+            /* 3) No name match at all – try IP matching instead. */
+            purple_debug_warning("bonjour",
+                "conv_match_by_name: no buddy named/localpart '%s'; trying IP match for %s\n",
+                bconv->buddy_name ? bconv->buddy_name : "(null)",
+                bconv->ip ? bconv->ip : "(no ip)");
+
+            bonjour_jabber_conv_match_by_ip(bconv);
+            return;
+        }
+    }
+
+    /* We have a PurpleBuddy – get its BonjourBuddy data. */
+    bb = purple_buddy_get_protocol_data(pb);
+    if (!bb) {
+        purple_debug_warning("bonjour",
+                             "conv_match_by_name: buddy '%s' has no protocol data\n",
+                             purple_buddy_get_name(pb));
+        /* No protocol data – we can’t really attach; fall back to IP. */
+        bonjour_jabber_conv_match_by_ip(bconv);
+        return;
+    }
+
+    purple_debug_info("bonjour",
+                      "Matched buddy %s to incoming conversation \"from\" attrib "
+                      "(buddy_name=%s, conv IP=%s)\n",
+                      purple_buddy_get_name(pb),
+                      bconv->buddy_name ? bconv->buddy_name : "(null)",
+                      bconv->ip ? bconv->ip : "(null)");
+
+    /* Attach conv. to buddy and remove from pending list */
+    jdata->pending_conversations =
+        g_slist_remove(jdata->pending_conversations, bconv);
+
+    /* If the buddy already has a conversation, replace it */
+    if (bb->conversation != NULL && bb->conversation != bconv)
+        bonjour_jabber_close_conversation(bb->conversation);
+
+    bconv->pb = pb;
+    bb->conversation = bconv;
+
+    /* Normalize buddy_name to the canonical buddy name, e.g. "inky@201:..." */
+    if (bconv->buddy_name) {
+        g_free(bconv->buddy_name);
+    }
+    bconv->buddy_name = g_strdup(purple_buddy_get_name(pb));
+
+    purple_debug_info("bonjour",
+                      "conv_match_by_name: matched conversation to buddy '%s'\n",
+                      bconv->buddy_name);
 }
 
 

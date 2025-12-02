@@ -233,161 +233,206 @@ static gchar * barev_contacts_filename(PurpleAccount *account)
                          user_dir, accname);
 }
 
-
 static void barev_load_contacts(PurpleAccount *account)
 {
-  gchar *filename = barev_contacts_filename(account);
-  char *contents = NULL;
-  gsize len = 0;
-  char **lines;
-  guint i;
+    gchar *filename = barev_contacts_filename(account);
+    char *contents = NULL;
+    gsize len = 0;
+    char **lines;
+    guint i;
 
-  if (!g_file_get_contents(filename, &contents, &len, NULL)) {
-    g_free(filename);
-    return; /* no contacts yet */
-  }
-
-  lines = g_strsplit(contents, "\n", 0);
-
-  for (i = 0; lines[i] != NULL; i++) {
-    char *line = lines[i];
-    char **parts;
-    char *name, *ip, *port_str;
-    int port;
-
-    if (*line == '\0' || *line == '#')
-      continue; /* skip empty/comments */
-
-    parts = g_strsplit(line, "\t", 3);
-    if (!parts[0] || !parts[1]) {
-      g_strfreev(parts);
-      continue;
+    if (!g_file_get_contents(filename, &contents, &len, NULL)) {
+        g_free(filename);
+        return; /* no contacts yet */
     }
 
-    name = parts[0];
-    ip = parts[1];
-    port_str = parts[2];
-
-    if (port_str && *port_str)
-      port = atoi(port_str);
-    else
-      port = BONJOUR_DEFAULT_PORT;
-
-    /* Create bonjour buddy and add to Purple list */
-    BonjourBuddy *bb = bonjour_buddy_new(name, account);
-    bb->port_p2pj = port;
-    bb->ips = g_slist_append(NULL, g_strdup(ip));
-
-    bonjour_buddy_add_to_purple(bb, NULL);
-
-    PurpleBuddy *pb = purple_find_buddy(account, name);
-    if (pb) {
-      purple_prpl_got_user_status(account,
-                                  purple_buddy_get_name(pb),
-                                  BONJOUR_STATUS_ID_OFFLINE,
-                                  NULL);
-    }
-
-    g_strfreev(parts);
-  }
-
-  g_strfreev(lines);
-  g_free(contents);
-  g_free(filename);
-}
-
-static void barev_save_contact(BonjourBuddy *bb)
-{
-  PurpleAccount *account = bb->account;
-  gchar *filename = barev_contacts_filename(account);
-  GString *out = g_string_new(NULL);
-  char *contents = NULL;
-  gsize len = 0;
-  char **lines;
-  guint i;
-  gboolean replaced = FALSE;
-  const char *name = bb->name;
-  const char *ip = bb->ips ? (const char *)bb->ips->data : "";
-  int port = bb->port_p2pj;
-
-  /* Read existing file, rewrite in-memory, then overwrite */
-  if (g_file_get_contents(filename, &contents, &len, NULL)) {
     lines = g_strsplit(contents, "\n", 0);
 
     for (i = 0; lines[i] != NULL; i++) {
-      char *line = lines[i];
-      char **parts;
-      if (*line == '\0') {
-        g_string_append_c(out, '\n');
-        continue;
-      }
-      parts = g_strsplit(line, "\t", 3);
-      if (parts[0] && g_strcmp0(parts[0], name) == 0) {
-        /* replace this entry */
-        g_string_append_printf(out, "%s\t%s\t%d\n", name, ip, port);
-        replaced = TRUE;
-      } else {
-        g_string_append(out, line);
-        g_string_append_c(out, '\n');
-      }
-      g_strfreev(parts);
+        char *line = lines[i];
+        char **parts;
+        char *nick, *ip, *port_str;
+        char *name;
+        int port;
+
+        if (*line == '\0' || *line == '#')
+            continue; /* skip empty/comments */
+
+        /* New format only: nick,ipv6,port */
+        parts = g_strsplit(line, ",", 3);
+        if (!parts[0] || !parts[1]) {
+            g_strfreev(parts);
+            continue;
+        }
+
+        nick     = parts[0];  /* not duplicated yet */
+        ip       = parts[1];
+        port_str = parts[2];
+
+        if (port_str && *port_str)
+            port = atoi(port_str);
+        else
+            port = BONJOUR_DEFAULT_PORT;
+
+        /* Construct JID-like name: "nick@ipv6" */
+        name = g_strdup_printf("%s@%s", nick, ip);
+
+        /* Create bonjour buddy and add to Purple list */
+        BonjourBuddy *bb = bonjour_buddy_new(name, account);
+        bb->port_p2pj = port;
+        bb->ips = g_slist_append(NULL, g_strdup(ip));
+
+        bonjour_buddy_add_to_purple(bb, NULL);
+
+        /* Set initial status to offline and alias to nick */
+        PurpleBuddy *pb = purple_find_buddy(account, name);
+        if (pb) {
+            purple_prpl_got_user_status(account,
+                                        purple_buddy_get_name(pb),
+                                        BONJOUR_STATUS_ID_OFFLINE,
+                                        NULL);
+            if (nick && *nick)
+                purple_blist_alias_buddy(pb, nick);
+        }
+
+        g_free(name);
+        g_strfreev(parts);
     }
 
     g_strfreev(lines);
     g_free(contents);
-  }
+    g_free(filename);
+}
 
-  if (!replaced) {
-    g_string_append_printf(out, "%s\t%s\t%d\n", name, ip, port);
-  }
+static void barev_save_contact(BonjourBuddy *bb)
+{
+    PurpleAccount *account = bb->account;
+    gchar *filename = barev_contacts_filename(account);
+    GString *out = g_string_new(NULL);
+    char *contents = NULL;
+    gsize len = 0;
+    char **lines;
+    guint i;
+    gboolean replaced = FALSE;
 
-  g_file_set_contents(filename, out->str, out->len, NULL);
-  g_string_free(out, TRUE);
-  g_free(filename);
+    const char *jid = bb->name; /* e.g. "inky@201:..." */
+    const char *ip  = bb->ips ? (const char *)bb->ips->data : "";
+    int port        = bb->port_p2pj;
+    gchar *nick     = NULL;
+
+    /* Derive nick from JID: localpart before '@' */
+    if (jid) {
+        const char *at = strchr(jid, '@');
+        if (at && at > jid)
+            nick = g_strndup(jid, (gsize)(at - jid));   /* "inky" */
+        else
+            nick = g_strdup(jid);                       /* fallback */
+    } else {
+        nick = g_strdup("");
+    }
+
+    /* Read existing file, rewrite in-memory, then overwrite */
+    if (g_file_get_contents(filename, &contents, &len, NULL)) {
+        lines = g_strsplit(contents, "\n", 0);
+
+        for (i = 0; lines[i] != NULL; i++) {
+            char *line = lines[i];
+            char **parts;
+
+            if (*line == '\0') {
+                g_string_append_c(out, '\n');
+                continue;
+            }
+
+            /* New format only: nick,ipv6,port */
+            parts = g_strsplit(line, ",", 3);
+
+            if (parts[0] && g_strcmp0(parts[0], nick) == 0) {
+                /* Replace this entry with updated "nick,ip,port" */
+                g_string_append_printf(out, "%s,%s,%d\n", nick, ip, port);
+                replaced = TRUE;
+            } else {
+                g_string_append(out, line);
+                g_string_append_c(out, '\n');
+            }
+
+            g_strfreev(parts);
+        }
+
+        g_strfreev(lines);
+        g_free(contents);
+    }
+
+    if (!replaced) {
+        g_string_append_printf(out, "%s,%s,%d\n", nick, ip, port);
+    }
+
+    g_file_set_contents(filename, out->str, out->len, NULL);
+    g_string_free(out, TRUE);
+    g_free(filename);
+    g_free(nick);
 }
 
 static void barev_remove_contact(PurpleAccount *account, const char *name)
 {
-  gchar *filename = barev_contacts_filename(account);
-  char *contents = NULL;
-  gsize len = 0;
-  GString *out;
-  char **lines;
-  guint i;
+    gchar *filename = barev_contacts_filename(account);
+    char *contents = NULL;
+    gsize len = 0;
+    GString *out;
+    char **lines;
+    guint i;
+    gchar *nick = NULL;
 
-  if (!g_file_get_contents(filename, &contents, &len, NULL)) {
+    /* Derive nick from full JID-like name ("nick@ipv6") */
+    if (name && *name) {
+        const char *at = strchr(name, '@');
+        if (at && at > name)
+            nick = g_strndup(name, (gsize)(at - name)); /* "inky" from "inky@201:..." */
+        else
+            nick = g_strdup(name);                      /* fallback */
+    } else {
+        nick = g_strdup("");
+    }
+
+    if (!g_file_get_contents(filename, &contents, &len, NULL)) {
+        g_free(filename);
+        g_free(nick);
+        return;
+    }
+
+    out = g_string_new(NULL);
+    lines = g_strsplit(contents, "\n", 0);
+
+    for (i = 0; lines[i] != NULL; i++) {
+        char *line = lines[i];
+        char **parts;
+
+        if (*line == '\0') {
+            g_string_append_c(out, '\n');
+            continue;
+        }
+
+        /* New format: nick,ipv6,port */
+        parts = g_strsplit(line, ",", 3);
+
+        if (parts[0] && nick && g_strcmp0(parts[0], nick) == 0) {
+            /* Skip this line (delete this contact) */
+            g_strfreev(parts);
+            continue;
+        }
+
+        g_string_append(out, line);
+        g_string_append_c(out, '\n');
+        g_strfreev(parts);
+    }
+
+    g_strfreev(lines);
+    g_free(contents);
+
+    g_file_set_contents(filename, out->str, out->len, NULL);
+    g_string_free(out, TRUE);
     g_free(filename);
-    return;
-  }
-
-  out = g_string_new(NULL);
-  lines = g_strsplit(contents, "\n", 0);
-
-  for (i = 0; lines[i] != NULL; i++) {
-    char *line = lines[i];
-    char **parts;
-
-    if (*line == '\0') {
-      g_string_append_c(out, '\n');
-      continue;
-    }
-    parts = g_strsplit(line, "\t", 3);
-    if (parts[0] && g_strcmp0(parts[0], name) == 0) {
-      /* skip this one (effectively deleting) */
-      g_strfreev(parts);
-      continue;
-    }
-    g_string_append(out, line);
-    g_string_append_c(out, '\n');
-    g_strfreev(parts);
-  }
-
-  g_strfreev(lines);
-  g_free(contents);
-
-  g_file_set_contents(filename, out->str, out->len, NULL);
-  g_string_free(out, TRUE);
-  g_free(filename);
+    g_free(nick);
 }
 
 static void
@@ -451,46 +496,6 @@ barev_add_buddy(PurpleConnection *gc, PurpleBuddy *buddy, PurpleGroup *group)
     g_free(info->ipv6_address);
     g_free(info);
 }
-
-
-//static void barev_add_buddy_ok_cb(BarevAddBuddyData *data, PurpleRequestFields *fields)
-//{
-//  PurpleConnection *pc = data->pc;
-//  PurpleBuddy *buddy = data->buddy;
-//  PurpleAccount *account = purple_connection_get_account(pc);
-//  BonjourBuddy *bb;
-//  const char *name = purple_buddy_get_name(buddy);
-//  PurpleRequestField *f;
-//  const char *ip, *port_str;
-//  int port;
-//
-//  f = purple_request_fields_get_field(fields, "ip");
-//  ip = purple_request_field_string_get_value(f);
-//  if (!ip || !*ip) {
-//  purple_debug_error("bonjour", "No IP/hostname provided for buddy %s\n", name);
-//  g_free(data);
-//  return;
-//}
-//
-//  f = purple_request_fields_get_field(fields, "port");
-//  port_str = purple_request_field_string_get_value(f);
-//  if (port_str && *port_str)
-//    port = atoi(port_str);
-//  else
-//    port = purple_account_get_int(account, "port", BONJOUR_DEFAULT_PORT);
-//
-//  bb = bonjour_buddy_new(name, account);
-//  bb->port_p2pj = port;
-//  bb->ips = g_slist_append(NULL, g_strdup(ip));
-//
-//  bonjour_buddy_add_to_purple(bb, buddy);
-//
-//  barev_save_contact(bb);
-//
-//  g_free(data);
-//}
-
-
 
 static char *default_firstname;
 static char *default_lastname;

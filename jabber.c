@@ -1633,121 +1633,70 @@ xep_iq_send_and_free(XepIq *iq)
 GSList *
 bonjour_jabber_get_local_ips(int fd)
 {
-  GSList *ips = NULL;
-  const char *address_text;
-  int ret;
+GSList *
+bonjour_jabber_get_local_ips(int fd)
+{
+    GSList *ips = NULL;
+    struct ifaddrs *ifap = NULL, *ifa;
+    int ret;
 
-#ifdef HAVE_GETIFADDRS /* This is required for IPv6 */
-    {
-        struct ifaddrs *ifap = NULL, *ifa;
-        int ret;
-        GSList *ygg_ips = NULL;
-        GSList *other_v6 = NULL;
-        GSList *v4_ips = NULL;
+    /* For Barev/Yggdrasil we only care about local Ygg IPv6 addresses.
+     * fd is unused here, but kept in the signature. */
 
-        ret = getifaddrs(&ifap);
-        if (ret != 0) {
-            const char *error = g_strerror(errno);
-            purple_debug_error("bonjour", "getifaddrs() error: %s\n",
-                               error ? error : "(null)");
-            return NULL;
-        }
-
-        for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
-            struct sockaddr *sa = ifa->ifa_addr;
-            char host[NI_MAXHOST];
-
-            if (!sa)
-                continue;
-
-            /* must be up, not loopback */
-            if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
-                continue;
-
-            if (sa->sa_family == AF_INET6) {
-                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
-
-                if (getnameinfo(sa, sizeof(*sin6),
-                                host, sizeof(host),
-                                NULL, 0, NI_NUMERICHOST) != 0)
-                    continue;
-
-                /* skip link-local and loopback */
-                if (g_str_has_prefix(host, "fe80:") ||
-                    g_str_has_prefix(host, "::1"))
-                    continue;
-
-                /* Prefer Yggdrasil-style addresses: 201:... */
-                if (g_str_has_prefix(host, "201:")) {
-                    ygg_ips = g_slist_prepend(ygg_ips, g_strdup(host));
-                } else {
-                    /* non-Ygg IPv6 */
-                    other_v6 = g_slist_prepend(other_v6, g_strdup(host));
-                }
-            } else if (sa->sa_family == AF_INET) {
-                struct sockaddr_in *sin4 = (struct sockaddr_in *)sa;
-
-                if (getnameinfo(sa, sizeof(*sin4),
-                                host, sizeof(host),
-                                NULL, 0, NI_NUMERICHOST) != 0)
-                    continue;
-
-                /* skip 127.0.0.0/8 etc. if you want, but for now keep them */
-                v4_ips = g_slist_prepend(v4_ips, g_strdup(host));
-            }
-        }
-
-        freeifaddrs(ifap);
-
-        /* final order: Ygg IPv6 first, then other IPv6, then IPv4 */
-        ips = g_slist_concat(ygg_ips, other_v6);
-        ips = g_slist_concat(ips, v4_ips);
+    ret = getifaddrs(&ifap);
+    if (ret != 0) {
+        purple_debug_error("bonjour",
+                           "getifaddrs() failed: %s\n",
+                           g_strerror(errno));
+        return NULL;
     }
-#else
-  {
-  char *tmp;
-  struct ifconf ifc;
-  struct ifreq *ifr;
-  char buffer[1024];
-  struct sockaddr_in *sinptr;
-  int source = fd;
 
-  if (fd < 0)
-    source = socket(PF_INET, SOCK_STREAM, 0);
+    for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        struct sockaddr *addr;
+        char host[NI_MAXHOST];
 
-  ifc.ifc_len = sizeof(buffer);
-  ifc.ifc_req = (struct ifreq *)buffer;
-  ret = ioctl(source, SIOCGIFCONF, &ifc);
+        if (!ifa->ifa_addr)
+            continue;
 
-  if (fd < 0)
-    close(source);
+        addr = ifa->ifa_addr;
 
-  if (ret < 0) {
-    const char *error = g_strerror(errno);
-    purple_debug_error("bonjour", "ioctl(SIOCGIFCONF) error: %s\n", error ? error : "(null)");
-    return NULL;
-  }
+        /* Only IPv6 */
+        if (addr->sa_family != AF_INET6)
+            continue;
 
-  tmp = buffer;
-  while (tmp < buffer + ifc.ifc_len) {
-    ifr = (struct ifreq *)tmp;
-    tmp += HX_SIZE_OF_IFREQ(*ifr);
+        if (getnameinfo(addr,
+                        sizeof(struct sockaddr_in6),
+                        host, sizeof(host),
+                        NULL, 0,
+                        NI_NUMERICHOST) != 0)
+            continue;
 
-    if (ifr->ifr_addr.sa_family == AF_INET) {
-      sinptr = (struct sockaddr_in *)&ifr->ifr_addr;
-      if ((ntohl(sinptr->sin_addr.s_addr) >> 24) != 127) {
-        address_text = inet_ntoa(sinptr->sin_addr);
-        ips = g_slist_prepend(ips, g_strdup(address_text));
-      }
-     }
-  }
-  }
-#endif
+        /* Skip link-local and loopback */
+        if (g_str_has_prefix(host, "fe80:")
+            || g_str_equal(host, "::1"))
+            continue;
 
-    if (ips == NULL)
+        /* Barev/Yggdrasil:
+         * Keep only “Ygg-style” globals (201:, 202:, 304:, …).
+         * Simple heuristic: textual form must start with '2' or '3'.
+         *
+         * This drops fd33:..., fc00:..., normal ULAs, etc.
+         */
+        if (host[0] != '2' && host[0] != '3')
+            continue;
+
         purple_debug_info("bonjour",
-                          "bonjour_jabber_get_local_ips: no local IPs found\n");
-  return ips;
+                          "Barev: adding local Ygg address %s (iface %s)\n",
+                          host, ifa->ifa_name);
+
+        /* Order doesn’t really matter, prepend is fine */
+        ips = g_slist_prepend(ips, g_strdup(host));
+    }
+
+    freeifaddrs(ifap);
+    return ips;
+}
+
 }
 
 void

@@ -26,6 +26,8 @@
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <netdb.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #else
@@ -70,6 +72,11 @@
 #else
 #  define HX_SIZE_OF_IFREQ(a) sizeof(a)
 #endif
+
+#ifndef HAVE_GETIFADDRS
+#define HAVE_GETIFADDRS 1
+#endif
+
 
 #define STREAM_END "</stream:stream>"
 /* TODO: specify version='1.0' and send stream features */

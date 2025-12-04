@@ -252,8 +252,11 @@ static void barev_load_contacts(PurpleAccount *account)
         char *line = lines[i];
         char *line_trimmed;
         char **parts;
-        char *name, *ip, *port_str;
+        char *id_or_name; /* old: "nick@ip", new: "nick" */
+        char *ip;
+        char *port_str;
         int port;
+        char *jid = NULL;
 
         if (!line || !*line)
             continue;
@@ -268,23 +271,36 @@ static void barev_load_contacts(PurpleAccount *account)
             continue;
         }
 
-        name = parts[0];
-        ip   = parts[1];
-        port_str = parts[2];
+        id_or_name = parts[0];
+        ip         = parts[1];
+        port_str   = parts[2];
 
         if (port_str && *port_str)
             port = atoi(port_str);
         else
             port = BONJOUR_DEFAULT_PORT;
 
+        /* Backward-compat:
+         *  - old format: "nick@ip,ip,port"
+         *  - new format: "nick,ip,port"
+         */
+        if (strchr(id_or_name, '@') != NULL) {
+            /* Legacy: already nick@ip */
+            jid = g_strdup(id_or_name);
+        } else {
+            /* New: build nick@ip */
+            jid = g_strdup_printf("%s@%s", id_or_name, ip);
+        }
+
         /* Create bonjour buddy and add to Purple list */
-        BonjourBuddy *bb = bonjour_buddy_new(name, account);
+        BonjourBuddy *bb = bonjour_buddy_new(jid, account);
         bb->port_p2pj = port;
         bb->ips = g_slist_append(NULL, g_strdup(ip));
 
         bonjour_buddy_add_to_purple(bb, NULL);
 
-        PurpleBuddy *pb = purple_find_buddy(account, name);
+        /* Mark as offline initially */
+        PurpleBuddy *pb = purple_find_buddy(account, jid);
         if (pb) {
             purple_prpl_got_user_status(account,
                                         purple_buddy_get_name(pb),
@@ -292,6 +308,7 @@ static void barev_load_contacts(PurpleAccount *account)
                                         NULL);
         }
 
+        g_free(jid);
         g_strfreev(parts);
     }
 
@@ -299,7 +316,6 @@ static void barev_load_contacts(PurpleAccount *account)
     g_free(contents);
     g_free(filename);
 }
-
 static void barev_save_contact(BonjourBuddy *bb)
 {
     PurpleAccount *account = bb->account;
@@ -309,11 +325,21 @@ static void barev_save_contact(BonjourBuddy *bb)
     gsize len = 0;
     char **lines = NULL;
     guint i;
-    gboolean replaced = FALSE;
 
-    const char *name = bb->name; /* e.g. "inky@201:b..." */
-    const char *ip   = bb->ips ? (const char *)bb->ips->data : "";
-    int port         = bb->port_p2pj;
+    const char *jid = bb->name ? bb->name : "";  /* e.g. "inky@201:..." */
+    const char *ip  = (bb->ips && bb->ips->data)
+                        ? (const char *)bb->ips->data
+                        : "";
+    int port        = bb->port_p2pj;
+
+    /* Localpart "inky" from "inky@201:..." */
+    const char *at = strchr(jid, '@');
+    char *localpart;
+
+    if (at && at != jid)
+        localpart = g_strndup(jid, (gsize)(at - jid));
+    else
+        localpart = g_strdup(jid);
 
     /* Read existing file, rewrite in memory, then overwrite */
     if (g_file_get_contents(filename, &contents, &len, NULL)) {
@@ -323,7 +349,8 @@ static void barev_save_contact(BonjourBuddy *bb)
             char *line = lines[i];
             char *line_trimmed;
             char **parts;
-            char *existing_name;
+            char *existing_field;
+            char *existing_local = NULL;
 
             if (!line || !*line)
                 continue; /* skip empty lines entirely */
@@ -333,13 +360,29 @@ static void barev_save_contact(BonjourBuddy *bb)
                 continue;
 
             parts = g_strsplit(line_trimmed, ",", 3);
-            existing_name = parts[0];
-
-            if (existing_name && g_strcmp0(existing_name, name) == 0) {
-                /* Replace this entry */
+            if (!parts[0]) {
                 g_strfreev(parts);
                 continue;
             }
+
+            existing_field = parts[0];
+
+            /* existing_field can be "nick" (new) or "nick@ip" (old) */
+            const char *at_old = strchr(existing_field, '@');
+            if (at_old && at_old != existing_field)
+                existing_local = g_strndup(existing_field,
+                                            (gsize)(at_old - existing_field));
+            else
+                existing_local = g_strdup(existing_field);
+
+            if (g_strcmp0(existing_local, localpart) == 0) {
+                /* Drop old record for this nick */
+                g_free(existing_local);
+                g_strfreev(parts);
+                continue;
+            }
+
+            g_free(existing_local);
 
             /* Keep this line */
             g_string_append(out, line_trimmed);
@@ -352,8 +395,10 @@ static void barev_save_contact(BonjourBuddy *bb)
         g_free(contents);
     }
 
-    /* Append/insert our updated record */
-    g_string_append_printf(out, "%s,%s,%d\n", name, ip, port);
+    /* Append our updated record in new format: "nick,ip,port" */
+    g_string_append_printf(out, "%s,%s,%d\n", localpart, ip ? ip : "", port);
+
+    g_free(localpart);
 
     /* Write back */
     g_file_set_contents(filename, out->str, out->len, NULL);
@@ -530,14 +575,37 @@ bonjour_login_barev(PurpleAccount *account)
   purple_debug_info("bonjour", "Account: %s\n",
                     purple_account_get_username(account));
 
+  //bd = g_new0(BonjourData, 1);
+  //purple_connection_set_protocol_data(gc, bd);
+
+  //const char *accname = purple_account_get_username(account);
+  //  if (!accname || !*accname)
+  //      accname = "barev";
+
+  //bd->jid = g_strdup_printf("%s@barev.local", accname);
+
   bd = g_new0(BonjourData, 1);
   purple_connection_set_protocol_data(gc, bd);
 
   const char *accname = purple_account_get_username(account);
-    if (!accname || !*accname)
-        accname = "barev";
+  if (!accname || !*accname)
+      accname = "barev";
 
-  bd->jid = g_strdup_printf("%s@barev.local", accname);
+  /* Prefer a local IPv6 (e.g. Yggdrasil) as our domain */
+  GSList *ips = bonjour_jabber_get_local_ips(-1);
+  const char *self_ip = ips ? (const char *)ips->data : NULL;
+
+  if (self_ip && *self_ip) {
+      /* nick@ipv6 */
+      bd->jid = g_strdup_printf("%s@%s", accname, self_ip);
+  } else {
+      /* Fallback – ideally never used, but avoids NULL */
+      bd->jid = g_strdup(accname);  /* or "%s@", accname, if you really want '@' */
+  }
+
+  /* free list from bonjour_jabber_get_local_ips() */
+  g_slist_free_full(ips, g_free);
+
 
   bd->jabber_data = g_new0(BonjourJabber, 1);
   bd->jabber_data->account = account;

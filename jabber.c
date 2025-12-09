@@ -78,17 +78,157 @@
 #define HAVE_GETIFADDRS 1
 #endif
 
-
-#define STREAM_END "</stream:stream>"
 /* TODO: specify version='1.0' and send stream features */
 #define DOCTYPE "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n" \
     "<stream:stream xmlns=\"jabber:client\" xmlns:stream=\"http://etherx.jabber.org/streams\" from=\"%s\" to=\"%s\">"
+
+
+#define PING_INTERVAL 30      /* Send ping every 30 seconds */
+#define PING_TIMEOUT 10       /* Wait 10 seconds for response */
+#define MAX_PING_FAILURES 3   /* Mark offline after 3 consecutive failures */
+
 
 enum sent_stream_start_types {
   NOT_SENT       = 0,
   PARTIALLY_SENT = 1,
   FULLY_SENT     = 2
 };
+
+/* Ping functions */
+/* Helper function to generate ping ID */
+static gchar* generate_ping_id(void) {
+  static guint counter = 0;
+  return g_strdup_printf("ping-%lu-%u", (unsigned long)time(NULL), counter++);
+}
+
+
+/* Ping timeout callback */
+static gboolean bonjour_jabber_ping_timeout_cb(gpointer data) {
+  BonjourJabberConversation *bconv = data;
+
+  if (!bconv || !bconv->pb) {
+    return FALSE;
+  }
+
+  bconv->ping_response_timer = 0;
+  bconv->ping_failures++;
+
+  purple_debug_warning("bonjour", "Ping timeout for %s (failures: %d)\n",
+                      purple_buddy_get_name(bconv->pb), bconv->ping_failures);
+
+  if (bconv->ping_failures >= MAX_PING_FAILURES) {
+    /* Mark buddy as offline */
+    purple_prpl_got_user_status(bconv->account,
+                               purple_buddy_get_name(bconv->pb),
+                               BONJOUR_STATUS_ID_OFFLINE,
+                               NULL);
+
+    /* Close conversation */
+    bonjour_jabber_close_conversation(bconv);
+
+    if (bconv->pb) {
+      BonjourBuddy *bb = purple_buddy_get_protocol_data(bconv->pb);
+      if (bb) {
+        bb->conversation = NULL;
+      }
+    }
+
+    return FALSE;
+  }
+
+  /* Try another ping immediately */
+  bonjour_jabber_send_ping_request(bconv);
+  return FALSE;
+}
+
+/* Periodic ping timer callback */
+static gboolean bonjour_jabber_ping_timer_cb(gpointer data) {
+  BonjourJabberConversation *bconv = data;
+
+  if (!bconv || bconv->socket < 0 || !bconv->pb) {
+    return FALSE;
+  }
+
+  /* Check if we've received any data recently */
+  time_t now = time(NULL);
+  if (now - bconv->last_activity > PING_INTERVAL * 2) {
+    /* Too long without activity, send ping */
+    bonjour_jabber_send_ping_request(bconv);
+  } else {
+    /* We've had recent activity, no need to ping yet */
+    purple_debug_info("bonjour", "Skipping ping for %s - recent activity\n",
+                     purple_buddy_get_name(bconv->pb));
+  }
+
+  return TRUE; /* Keep timer running */
+}
+
+/* Start ping mechanism */
+void bonjour_jabber_start_ping(BonjourJabberConversation *bconv) {
+  if (!bconv) return;
+
+  /* Stop any existing ping timers */
+  bonjour_jabber_stop_ping(bconv);
+
+  /* Initialize ping state */
+  bconv->last_activity = time(NULL);
+  bconv->ping_failures = 0;
+  g_free(bconv->last_ping_id);
+  bconv->last_ping_id = NULL;
+
+  /* Start periodic ping timer */
+  bconv->ping_timer = purple_timeout_add_seconds(PING_INTERVAL,
+                                                bonjour_jabber_ping_timer_cb,
+                                                bconv);
+
+  purple_debug_info("bonjour", "Started ping mechanism for %s\n",
+                   bconv->pb ? purple_buddy_get_name(bconv->pb) : "unknown");
+}
+
+/* Stop ping mechanism */
+void bonjour_jabber_stop_ping(BonjourJabberConversation *bconv) {
+  if (!bconv) return;
+
+  if (bconv->ping_timer) {
+    purple_timeout_remove(bconv->ping_timer);
+    bconv->ping_timer = 0;
+  }
+
+  if (bconv->ping_response_timer) {
+    purple_timeout_remove(bconv->ping_response_timer);
+    bconv->ping_response_timer = 0;
+  }
+
+  g_free(bconv->last_ping_id);
+  bconv->last_ping_id = NULL;
+  bconv->ping_failures = 0;
+}
+
+
+/* Handle ping response */
+static void bonjour_jabber_handle_ping_response(xmlnode *packet, BonjourJabberConversation *bconv) {
+  if (!packet || !bconv || !bconv->last_ping_id) return;
+
+  const char *type = xmlnode_get_attrib(packet, "type");
+  const char *id = xmlnode_get_attrib(packet, "id");
+
+  if (type && g_ascii_strcasecmp(type, "result") == 0 &&
+      id && g_strcmp0(id, bconv->last_ping_id) == 0) {
+
+    /* Cancel response timeout */
+    if (bconv->ping_response_timer) {
+      purple_timeout_remove(bconv->ping_response_timer);
+      bconv->ping_response_timer = 0;
+    }
+
+    /* Reset failure counter */
+    bconv->ping_failures = 0;
+
+    purple_debug_info("bonjour", "Received ping response from %s\n",
+                     purple_buddy_get_name(bconv->pb));
+  }
+}
+
 
 static void
 xep_iq_parse(xmlnode *packet, PurpleBuddy *pb);
@@ -309,6 +449,13 @@ bonjour_jabber_conv_new(PurpleBuddy *pb, PurpleAccount *account, const char *ip)
   bconv->pb = pb;
   bconv->account = account;
   bconv->ip = g_strdup(ip);
+
+  /* Initialize ping fields */
+  bconv->ping_timer = 0;
+  bconv->ping_response_timer = 0;
+  bconv->last_ping_id = NULL;
+  bconv->last_activity = time(NULL);
+  bconv->ping_failures = 0;
 
   bonjour_parser_setup(bconv);
 
@@ -654,9 +801,26 @@ bonjour_jabber_process_packet(PurpleBuddy *pb, xmlnode *packet) {
   g_return_if_fail(packet != NULL);
   g_return_if_fail(pb != NULL);
 
+  BonjourBuddy *bb = purple_buddy_get_protocol_data(pb);
+  if (bb && bb->conversation) {
+    bb->conversation->last_activity = time(NULL);
+  }
+
   if (purple_strequal(packet->name, "message")) {
     _jabber_parse_and_write_message_to_ui(packet, pb);
   } else if (purple_strequal(packet->name, "iq")) {
+    /* Check for ping first */
+    if (bb && bb->conversation) {
+      if (bonjour_jabber_handle_ping(packet, bb->conversation)) {
+        /* Ping handled, don't process further */
+        return;
+      }
+
+      /* Check for ping response */
+      bonjour_jabber_handle_ping_response(packet, bb->conversation);
+    }
+
+    /* Process other IQ packets */
     xep_iq_parse(packet, pb);
   } else if (purple_strequal(packet->name, "presence")) {
     _bonjour_handle_presence(pb, packet);
@@ -923,6 +1087,8 @@ void bonjour_jabber_stream_started(BonjourJabberConversation *bconv) {
                                         purple_buddy_get_name(pb),
                                         BONJOUR_STATUS_ID_AVAILABLE,
                                         NULL);
+      /* Start ping mechanism */
+      bonjour_jabber_start_ping(bconv);
     }
 
     /* and now the original buffered-send code: */
@@ -1603,6 +1769,7 @@ void
 bonjour_jabber_close_conversation(BonjourJabberConversation *bconv)
 {
   if (bconv != NULL) {
+    bonjour_jabber_stop_ping(bconv);
     BonjourData *bd = NULL;
 
     if(PURPLE_CONNECTION_IS_VALID(bconv->account->gc)) {
@@ -1940,3 +2107,84 @@ append_iface_if_linklocal(char *ip, guint32 interface_param) {
   snprintf(ip + strlen(ip), len_remain, "%%%d",
      interface_param);
 }
+
+
+/* Other ping functions */
+/* Send ping request */
+void bonjour_jabber_send_ping_request(BonjourJabberConversation *bconv) {
+  if (!bconv || bconv->socket < 0 || !bconv->pb) {
+    return;
+  }
+
+  /* Generate ping ID */
+  g_free(bconv->last_ping_id);
+  bconv->last_ping_id = generate_ping_id();
+
+  /* Create ping IQ */
+  xmlnode *iq = xmlnode_new("iq");
+  xmlnode_set_attrib(iq, "type", "get");
+  xmlnode_set_attrib(iq, "id", bconv->last_ping_id);
+  xmlnode_set_attrib(iq, "from", bonjour_get_jid(bconv->account));
+  xmlnode_set_attrib(iq, "to", purple_buddy_get_name(bconv->pb));
+
+  xmlnode *ping = xmlnode_new_child(iq, "ping");
+  xmlnode_set_namespace(ping, "urn:xmpp:ping");
+
+  /* Send ping */
+  char *xml = xmlnode_to_str(iq, NULL);
+  _send_data(bconv->pb, xml);
+
+  xmlnode_free(iq);
+  g_free(xml);
+
+  purple_debug_info("bonjour", "Sent ping to %s (id: %s)\n",
+                   purple_buddy_get_name(bconv->pb), bconv->last_ping_id);
+
+  /* Start response timeout timer */
+  if (bconv->ping_response_timer) {
+    purple_timeout_remove(bconv->ping_response_timer);
+  }
+  bconv->ping_response_timer = purple_timeout_add_seconds(PING_TIMEOUT,
+                                                         bonjour_jabber_ping_timeout_cb,
+                                                         bconv);
+}
+
+/* Handle incoming ping request */
+gboolean bonjour_jabber_handle_ping(xmlnode *packet, BonjourJabberConversation *bconv) {
+  if (!packet || !bconv) return FALSE;
+
+  const char *type = xmlnode_get_attrib(packet, "type");
+  const char *id = xmlnode_get_attrib(packet, "id");
+
+  if (type && g_ascii_strcasecmp(type, "get") == 0) {
+    /* Check for ping element */
+    xmlnode *ping = xmlnode_get_child_with_namespace(packet, "ping", "urn:xmpp:ping");
+    if (!ping) {
+      ping = xmlnode_get_child_with_namespace(packet, "ping", "urn:yggb:ping");
+    }
+
+    if (ping) {
+      /* Send ping response */
+      xmlnode *response = xmlnode_new("iq");
+      xmlnode_set_attrib(response, "type", "result");
+      xmlnode_set_attrib(response, "id", id ? id : "");
+      xmlnode_set_attrib(response, "to", xmlnode_get_attrib(packet, "from"));
+      xmlnode_set_attrib(response, "from", xmlnode_get_attrib(packet, "to"));
+
+      char *xml = xmlnode_to_str(response, NULL);
+      if (bconv->pb) {
+        _send_data(bconv->pb, xml);
+      }
+
+      xmlnode_free(response);
+      g_free(xml);
+
+      purple_debug_info("bonjour", "Responded to ping from %s\n",
+                       xmlnode_get_attrib(packet, "from"));
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+

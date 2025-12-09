@@ -33,6 +33,8 @@
 #include "account.h"
 #include "circbuffer.h"
 
+#define STREAM_END "</stream:stream>"
+
 typedef struct _BonjourJabber
 {
   gint port;
@@ -65,6 +67,12 @@ typedef struct _BonjourJabberConversation
   gchar *ip;
   /* This points to a data entry in BonjourBuddy->ips */
   const gchar *ip_link;
+  /* Ping support */
+  guint ping_timer;           /* Timer for sending pings */
+  guint ping_response_timer;  /* Timer for waiting for ping response */
+  gchar *last_ping_id;        /* ID of last sent ping */
+  time_t last_activity;       /* Last time we received any data */
+  gint ping_failures;         /* Consecutive ping failures */
 } BonjourJabberConversation;
 
 /**
@@ -121,5 +129,13 @@ int bonjour_jabber_open_stream(BonjourJabber *jdata, const char *to);
 
 
 void append_iface_if_linklocal(char *ip, guint32 interface_param);
+
+// for ping
+
+void bonjour_jabber_start_ping(BonjourJabberConversation *bconv);
+void bonjour_jabber_stop_ping(BonjourJabberConversation *bconv);
+gboolean bonjour_jabber_handle_ping(xmlnode *packet, BonjourJabberConversation *bconv);
+void bonjour_jabber_send_ping_request(BonjourJabberConversation *bconv);
+
 
 #endif /* _BONJOUR_JABBER_H_ */

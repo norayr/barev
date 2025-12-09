@@ -926,6 +926,11 @@ bonjour_set_status(PurpleAccount *account, PurpleStatus *status)
         continue;
 
       bonjour_jabber_send_presence(pb, show, stripped, offline);
+      /* If going offline, also send stream end */
+      if (offline && bb->conversation->socket >= 0) {
+        size_t len = strlen(STREAM_END);
+        send(bb->conversation->socket, STREAM_END, len, 0);
+      }
     }
     g_slist_free(buddies);
   }

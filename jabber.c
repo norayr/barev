@@ -94,6 +94,93 @@ enum sent_stream_start_types {
   FULLY_SENT     = 2
 };
 
+static void
+safe_set_buddy_status(PurpleAccount *account, const char *who, const char *status_id,
+                      const char *attr_name, const char *attr_value)
+{
+    if (!account || !who || !status_id) {
+        purple_debug_error("bonjour", "NULL parameter in safe_set_buddy_status\n");
+        return;
+    }
+
+    PurpleStatusType *stype = purple_account_get_status_type(account, status_id);
+    if (!stype) {
+        purple_debug_error("bonjour", "No status type '%s' for account\n", status_id);
+        return;
+    }
+
+    if (attr_name && attr_value) {
+        purple_prpl_got_user_status(account, who, status_id, attr_name, attr_value, NULL);
+    } else {
+        purple_prpl_got_user_status(account, who, status_id, NULL);
+    }
+}
+
+/* Validate that JID IP matches actual connection IP */
+static gboolean
+validate_ip_consistency(BonjourJabberConversation *bconv, const char *from_jid)
+{
+    struct sockaddr_storage peer_addr;
+    socklen_t peer_addr_len = sizeof(peer_addr);
+    char peer_ip[INET6_ADDRSTRLEN];
+    char *at_sign, *jid_ip;
+    gboolean valid = FALSE;
+
+    if (!from_jid || !bconv || bconv->socket < 0)
+        return FALSE;
+
+    /* Extract IP from JID (format: nick@ipv6_address) */
+    at_sign = strchr(from_jid, '@');
+    if (!at_sign) {
+        purple_debug_error("bonjour", "Invalid JID format (no @): %s\n", from_jid);
+        return FALSE;
+    }
+
+    jid_ip = g_strdup(at_sign + 1);
+
+    /* Get actual peer IP from socket */
+    if (getpeername(bconv->socket, (struct sockaddr *)&peer_addr, &peer_addr_len) != 0) {
+        purple_debug_error("bonjour", "Failed to get peer address: %s\n", strerror(errno));
+        g_free(jid_ip);
+        return FALSE;
+    }
+
+    if (peer_addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&peer_addr;
+        inet_ntop(AF_INET6, &addr6->sin6_addr, peer_ip, INET6_ADDRSTRLEN);
+
+        /* Remove scope ID if present (e.g., %eth0) */
+        char *percent = strchr(peer_ip, '%');
+        if (percent) *percent = '\0';
+
+        /* Compare IPs (case-insensitive for hex) */
+        if (g_ascii_strcasecmp(jid_ip, peer_ip) == 0) {
+            valid = TRUE;
+            purple_debug_info("bonjour", "IP validation OK: JID=%s matches peer\n", jid_ip);
+        } else {
+            purple_debug_error("bonjour",
+                "IP MISMATCH! JID says '%s' but connected from '%s'. REJECTING!\n",
+                jid_ip, peer_ip);
+
+            /* Send error response before closing */
+            const char *error_msg =
+                "<stream:error>"
+                "<host-unknown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"
+                "<text xmlns='urn:ietf:params:xml:ns:xmpp-streams'>"
+                "IP address mismatch: Your JID must match your connection IP"
+                "</text>"
+                "</stream:error>"
+                "</stream:stream>";
+            send(bconv->socket, error_msg, strlen(error_msg), 0);
+        }
+    }
+
+    g_free(jid_ip);
+    return valid;
+}
+
+
+
 /* Helper to format the IPv6 */
 /* Update format_host_for_proxy in jabber.c */
 
@@ -270,10 +357,6 @@ static void bonjour_jabber_handle_ping_response(xmlnode *packet, BonjourJabberCo
   }
 }
 
-
-static void
-xep_iq_parse(xmlnode *packet, PurpleBuddy *pb);
-
 static gboolean
 is_ipv6_address(const gchar *str)
 {
@@ -308,7 +391,6 @@ is_ipv6_address(const gchar *str)
     /* IPv6 must have at least 2 colons */
     return (colons >= 2);
 }
-
 
 /*
  * Return TRUE if the string `host` looks like a Yggdrasil IPv6 address.
@@ -417,6 +499,45 @@ bonjour_find_buddy_by_localpart(PurpleAccount *account, const char *jid)
 }
 
 static void
+xep_iq_parse(xmlnode *packet, PurpleBuddy *pb)
+{
+  PurpleAccount *account;
+  PurpleConnection *gc;
+
+    if (!packet || !pb) {
+    purple_debug_error("bonjour", "xep_iq_parse: NULL input\n");
+    return;
+    }
+    if (!packet) {
+        purple_debug_error("bonjour", "xep_iq_parse: NULL packet!\n");
+        return;
+    }
+    if (!pb) {
+        purple_debug_error("bonjour", "xep_iq_parse: NULL buddy!\n");
+        return;
+    }
+
+    BonjourBuddy *bb = purple_buddy_get_protocol_data(pb);
+    if (!bb) {
+        purple_debug_error("bonjour", "xep_iq_parse: No buddy data!\n");
+        return;
+    }
+    if (!bb->conversation) {
+        purple_debug_error("bonjour", "xep_iq_parse: No conversation!\n");
+        return;
+    }
+
+  account = purple_buddy_get_account(pb);
+  gc = purple_account_get_connection(account);
+
+  if (xmlnode_get_child(packet, "si") != NULL || xmlnode_get_child(packet, "error") != NULL)
+    xep_si_parse(gc, packet, pb);
+  else
+    xep_bytestreams_parse(gc, packet, pb);
+}
+
+
+static void
 _bonjour_handle_presence(PurpleBuddy *pb, xmlnode *presence_node)
 {
     PurpleAccount *account;
@@ -497,10 +618,12 @@ _bonjour_handle_presence(PurpleBuddy *pb, xmlnode *presence_node)
 
 
     if (status_text) {
-        purple_prpl_got_user_status(account, name, status_id,
-                                    "message", status_text, NULL);
+        //purple_prpl_got_user_status(account, name, status_id,
+         //                           "message", status_text, NULL);
+        safe_set_buddy_status(account, name, status_id, "message", status_text);
     } else {
-        purple_prpl_got_user_status(account, name, status_id, NULL);
+        //purple_prpl_got_user_status(account, name, status_id, NULL);
+        safe_set_buddy_status(account, name, status_id, NULL, NULL);
     }
 
     purple_prpl_got_user_idle(account, name, FALSE, 0);
@@ -874,9 +997,18 @@ bonjour_jabber_send_presence(PurpleBuddy *pb,
 
 void
 bonjour_jabber_process_packet(PurpleBuddy *pb, xmlnode *packet) {
+   if (!packet) {
+    purple_debug_error("bonjour", "process_packet: NULL packet\n");
+    return;
+  }
 
-  g_return_if_fail(packet != NULL);
-  g_return_if_fail(pb != NULL);
+  if (!pb) {
+    purple_debug_error("bonjour", "process_packet: NULL buddy\n");
+    return;
+  }
+
+  //g_return_if_fail(packet != NULL);
+  //g_return_if_fail(pb != NULL);
 
   BonjourBuddy *bb = purple_buddy_get_protocol_data(pb);
   if (bb && bb->conversation) {
@@ -1128,6 +1260,13 @@ void bonjour_jabber_stream_started(BonjourJabberConversation *bconv) {
                        err ? err : "(null)");
 
     if (bconv->pb) {
+      if (!validate_ip_consistency(bconv, purple_buddy_get_name(bconv->pb))) {
+      purple_debug_error("bonjour",
+        "Closing connection due to IP mismatch for %s\n",
+        purple_buddy_get_name(bconv->pb));
+      async_bonjour_jabber_close_conversation(bconv);
+      return;
+      }
       PurpleConversation *conv;
       conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_IM,
                                                    bname, bconv->account);
@@ -1576,6 +1715,16 @@ bonjour_jabber_conv_match_by_name(BonjourJabberConversation *bconv)
 
     bconv->pb = pb;
     bb->conversation = bconv;
+    if (bconv->pb != NULL) {
+    /* Validate IP consistency */
+    if (!validate_ip_consistency(bconv, purple_buddy_get_name(bconv->pb))) {
+      purple_debug_error("bonjour",
+        "Closing connection due to IP mismatch for %s\n",
+        purple_buddy_get_name(bconv->pb));
+      async_bonjour_jabber_close_conversation(bconv);
+      return;
+      }
+    }
     purple_debug_info("bonjour", "Setting bb->conversation for %s to %p\n",
                   purple_buddy_get_name(pb), bconv);
 
@@ -1661,15 +1810,25 @@ void bonjour_jabber_conv_match_by_ip(BonjourJabberConversation *bconv) {
     purple_debug_info("bonjour", "Setting bb->conversation for %s to %p\n",
                   purple_buddy_get_name(pb), bconv);
 
-    /* We've matched a buddy.  First, make sure we aren't already talking to this person elsewhere */
-    if(bb->conversation != NULL && bb->conversation != bconv) {
-      purple_debug_info("bonjour", "Matched buddy %s is already in a conversation.\n", purple_buddy_get_name(pb));
-      /* We can't delete the bconv here, but we can unassociate ourselves from it */
-      bconv->pb = NULL;
-      bb->conversation = bconv;
-      purple_debug_info("bonjour", "Setting bb->conversation for %s to %p\n",
-                  purple_buddy_get_name(pb), bconv);
+    if (bconv->pb != NULL) {
+    /* Validate IP consistency */
+    if (!validate_ip_consistency(bconv, purple_buddy_get_name(bconv->pb))) {
+      purple_debug_error("bonjour",
+        "Closing connection due to IP mismatch for %s\n",
+        purple_buddy_get_name(bconv->pb));
+      async_bonjour_jabber_close_conversation(bconv);
+      return;
+      }
     }
+    /* We've matched a buddy.  First, make sure we aren't already talking to this person elsewhere */
+    //if(bb->conversation != NULL && bb->conversation != bconv) {
+    //  purple_debug_info("bonjour", "Matched buddy %s is already in a conversation.\n", purple_buddy_get_name(pb));
+    //  /* We can't delete the bconv here, but we can unassociate ourselves from it */
+    //  bconv->pb = NULL;
+    //  bb->conversation = bconv;
+    //  purple_debug_info("bonjour", "Setting bb->conversation for %s to %p\n",
+    //              purple_buddy_get_name(pb), bconv);
+    //}
 
     /* Break because we only want to match one buddy */
     break;
@@ -1802,12 +1961,37 @@ _find_or_start_conversation(BonjourJabber *jdata, const gchar *to)
 
                 _purple_network_set_common_socket_flags(sock);
 
+                /* Try to bind to source address, but don't fail if it doesn't work */
+                const char *my_jid = bonjour_get_jid(jdata->account);
+                if (my_jid) {
+                    char *at_sign = strchr(my_jid, '@');
+                    if (at_sign) {
+                        char *my_ip = at_sign + 1;
+                        struct sockaddr_in6 bind_addr;
+                        memset(&bind_addr, 0, sizeof(bind_addr));
+                        bind_addr.sin6_family = AF_INET6;
+
+                        if (inet_pton(AF_INET6, my_ip, &bind_addr.sin6_addr) == 1) {
+                            if (bind(sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+                                purple_debug_warning("bonjour",
+                                    "Failed to bind to %s: %s (continuing anyway)\n",
+                                    my_ip, g_strerror(errno));
+                            } else {
+                                purple_debug_info("bonjour", "Bound socket to %s\n", my_ip);
+                            }
+                        } else {
+                            purple_debug_warning("bonjour",
+                                "Could not parse our own IP %s for binding\n", my_ip);
+                        }
+                    }
+                }
 
                 if (connect(sock, (struct sockaddr*)&addr6, sizeof(addr6)) == 0 ||
                     (errno == EINPROGRESS)) {
                     /* Connection successful or in progress */
                     bb->conversation = bonjour_jabber_conv_new(pb, jdata->account, ip);
-                    purple_debug_info("bonjour", "Setting bb->conversation for %s to %p\n", purple_buddy_get_name(pb), bb->conversation);
+                    purple_debug_info("bonjour", "Setting bb->conversation for %s to %p\n",
+                                      purple_buddy_get_name(pb), bb->conversation);
                     bb->conversation->socket = sock;
 
                     /* Set up handler for when connection completes */
@@ -2187,23 +2371,6 @@ check_if_blocked(PurpleBuddy *pb)
   return blocked;
 }
 
-static void
-xep_iq_parse(xmlnode *packet, PurpleBuddy *pb)
-{
-  PurpleAccount *account;
-  PurpleConnection *gc;
-
-  if(check_if_blocked(pb))
-    return;
-
-  account = purple_buddy_get_account(pb);
-  gc = purple_account_get_connection(account);
-
-  if (xmlnode_get_child(packet, "si") != NULL || xmlnode_get_child(packet, "error") != NULL)
-    xep_si_parse(gc, packet, pb);
-  else
-    xep_bytestreams_parse(gc, packet, pb);
-}
 
 int
 xep_iq_send_and_free(XepIq *iq)
@@ -2415,4 +2582,3 @@ gboolean bonjour_jabber_handle_ping(xmlnode *packet, BonjourJabberConversation *
 
   return FALSE;
 }
-

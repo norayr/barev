@@ -61,6 +61,7 @@ Currently, if you want to change your contact's port, you need to
 * p2p messages
 * file transfers
 * statuses: available, away, do not disturb, status lines.
+* avatars (XEP-0153)
 
 # What does not work
 

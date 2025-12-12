@@ -59,6 +59,8 @@ static void bonjour_login(PurpleAccount *account);
 
 static void bonjour_login_barev(PurpleAccount *account);
 
+static void bonjour_get_info(PurpleConnection *gc, const char *who);
+
 /* Structure for parsing manual buddy format */
 typedef struct {
   char *nick;
@@ -1352,7 +1354,7 @@ static PurplePluginProtocolInfo prpl_info =
   bonjour_send_im,                                         /* send_im */
   NULL,                                                    /* set_info */
   NULL,                                                    /* send_typing */
-  NULL,                                                    /* get_info */
+  bonjour_get_info,                                                    /* get_info */
   bonjour_set_status,                                      /* set_status */
   NULL,                                                    /* set_idle */
   NULL,                                                    /* change_passwd */
@@ -1625,5 +1627,40 @@ init_plugin(PurplePlugin *plugin)
 
   my_protocol = plugin;
 }
+
+static void
+bonjour_get_info(PurpleConnection *gc, const char *who)
+{
+    PurpleAccount *account;
+    PurpleBuddy *pb;
+    BonjourBuddy *bb;
+    PurpleNotifyUserInfo *info;
+
+    if (!gc || !who) return;
+
+    account = purple_connection_get_account(gc);
+    pb = purple_find_buddy(account, who);
+
+    info = purple_notify_user_info_new();
+    purple_notify_user_info_add_pair_plaintext(info, "JID", who);
+
+    if (pb && (bb = purple_buddy_get_protocol_data(pb)) != NULL) {
+        if (bb->status)
+            purple_notify_user_info_add_pair_plaintext(info, "Show", bb->status);
+        if (bb->msg)
+            purple_notify_user_info_add_pair_plaintext(info, "Status", bb->msg);
+    }
+
+    purple_notify_userinfo(gc, who, info, NULL, NULL);
+    purple_notify_user_info_destroy(info);
+
+    /* If we have a live stream, request vCard and show richer info when it returns */
+    if (pb && bb && bb->conversation && bb->conversation->socket >= 0) {
+        bonjour_jabber_request_vcard(pb, TRUE);
+    } else {
+        purple_debug_info("bonjour", "Get Info: no active stream for %s, skipping vCard fetch\n", who);
+    }
+}
+
 
 PURPLE_INIT_PLUGIN(bonjour, init_plugin, info);

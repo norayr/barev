@@ -1145,13 +1145,61 @@ bonjour_convo_closed(PurpleConnection *connection, const char *who)
   bb->conversation = NULL;
 }
 
-static
-void bonjour_set_buddy_icon(PurpleConnection *conn, PurpleStoredImage *img)
+static void
+bonjour_set_buddy_icon(PurpleConnection *conn, PurpleStoredImage *img)
 {
-  (void)conn;
-  (void)img;
-  /* Barev-only: we don't publish buddy icons via mDNS.
-   * If we want avatars later, we'll do it via XMPP/Barev mechanisms. */
+    PurpleAccount *account;
+    PurpleStatus *status;
+    const char *message;
+    gchar *stripped;
+    gboolean offline = FALSE;
+    const char *show = NULL;
+    GSList *buddies, *l;
+
+    (void)img;
+
+    if (!conn || !(account = conn->account))
+        return;
+
+    status = purple_account_get_active_status(account);
+    if (!status)
+        return;
+
+    message = purple_status_get_attr_string(status, "message");
+    if (!message)
+        message = "";
+
+    stripped = purple_markup_strip_html(message);
+
+    /* Same mapping logic as bonjour_set_status() */
+    {
+        PurpleStatusType *stype = purple_status_get_type(status);
+        const char *id = stype ? purple_status_type_get_id(stype) : NULL;
+
+        if (id && g_strcmp0(id, BONJOUR_STATUS_ID_OFFLINE) == 0) {
+            offline = TRUE;
+        } else if (id && g_strcmp0(id, BONJOUR_STATUS_ID_AWAY) == 0) {
+            show = "away";
+        } else if (id && g_strcmp0(id, BONJOUR_STATUS_ID_BUSY) == 0) {
+            show = "dnd";
+        } else {
+            show = NULL;
+        }
+    }
+
+    /* Notify only buddies that currently have an active pipe */
+    buddies = purple_find_buddies(account, NULL);
+    for (l = buddies; l; l = l->next) {
+        PurpleBuddy *pb = (PurpleBuddy *)l->data;
+        BonjourBuddy *bb = pb ? purple_buddy_get_protocol_data(pb) : NULL;
+
+        if (bb && bb->conversation) {
+            bonjour_jabber_send_presence(pb, show, stripped, offline);
+        }
+    }
+    g_slist_free(buddies);
+
+    g_free(stripped);
 }
 
 static char *

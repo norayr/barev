@@ -86,7 +86,11 @@
 #define PING_INTERVAL 30      /* Send ping every 30 seconds */
 #define PING_TIMEOUT 10       /* Wait 10 seconds for response */
 #define MAX_PING_FAILURES 3   /* Mark offline after 3 consecutive failures */
+#define BAREV_VCARD_NS         "vcard-temp"
+#define BAREV_VCARD_UPDATE_NS  "vcard-temp:x:update"
 
+static guint barev_avatar_id_counter = 0;
+static gint _send_data(PurpleBuddy *pb, char *message);
 
 enum sent_stream_start_types {
   NOT_SENT       = 0,
@@ -94,6 +98,286 @@ enum sent_stream_start_types {
   FULLY_SENT     = 2
 };
 
+static gchar *
+barev_guess_mime_type(const guchar *data, gsize len)
+{
+    if (!data || len < 4) return NULL;
+
+    /* PNG */
+    if (len >= 8 &&
+        data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 &&
+        data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A)
+        return g_strdup("image/png");
+
+    /* JPEG */
+    if (len >= 2 && data[0] == 0xFF && data[1] == 0xD8)
+        return g_strdup("image/jpeg");
+
+    /* GIF */
+    if (len >= 6 &&
+        data[0] == 'G' && data[1] == 'I' && data[2] == 'F' &&
+        (data[3] == '8') && (data[4] == '7' || data[4] == '9') && data[5] == 'a')
+        return g_strdup("image/gif");
+
+    return NULL;
+}
+
+static gchar *
+barev_sha1_hex(const guchar *data, gsize len)
+{
+    if (!data || len == 0) return NULL;
+    /* Returns newly allocated lowercase hex string */
+    return g_compute_checksum_for_data(G_CHECKSUM_SHA1, data, len);
+}
+
+static gchar *
+barev_make_iq_id(const char *prefix)
+{
+    return g_strdup_printf("%s-%lu-%u",
+                           prefix ? prefix : "id",
+                           (unsigned long)time(NULL),
+                           ++barev_avatar_id_counter);
+}
+
+/* Returns sha1 hex of current account icon bytes (or NULL if none). */
+static gchar *
+barev_get_account_avatar_sha1(PurpleAccount *account)
+{
+    PurpleStoredImage *img;
+    const guchar *data;
+    gsize len;
+    gchar *sha1 = NULL;
+
+    if (!account) return NULL;
+
+    img = purple_buddy_icons_find_account_icon(account);
+    if (!img) return NULL;
+
+    data = (const guchar *)purple_imgstore_get_data(img);
+    len  = (gsize)purple_imgstore_get_size(img);
+
+    if (data && len > 0)
+        sha1 = barev_sha1_hex(data, len);
+
+    purple_imgstore_unref(img);
+    return sha1;
+}
+
+static void
+barev_presence_add_avatar_update(xmlnode *presence_node, PurpleAccount *account)
+{
+    xmlnode *x, *photo;
+    gchar *sha1 = barev_get_account_avatar_sha1(account);
+
+    x = xmlnode_new_child(presence_node, "x");
+    xmlnode_set_namespace(x, BAREV_VCARD_UPDATE_NS);
+
+    photo = xmlnode_new_child(x, "photo");
+    if (sha1 && *sha1)
+        xmlnode_insert_data(photo, sha1, strlen(sha1));
+
+    g_free(sha1);
+}
+
+static void
+barev_send_vcard_get(PurpleBuddy *pb)
+{
+    BonjourBuddy *bb;
+    PurpleAccount *account;
+    const char *from, *to;
+    xmlnode *iq, *vcard;
+    gchar *id, *xml;
+
+    if (!pb) return;
+
+    bb = purple_buddy_get_protocol_data(pb);
+    if (!bb || !bb->conversation || bb->conversation->socket < 0)
+        return;
+
+    account = purple_buddy_get_account(pb);
+    from = account ? bonjour_get_jid(account) : "";
+    to   = purple_buddy_get_name(pb);
+
+    id = barev_make_iq_id("vcard");
+
+    iq = xmlnode_new("iq");
+    xmlnode_set_attrib(iq, "type", "get");
+    xmlnode_set_attrib(iq, "id", id);
+    if (from && *from) xmlnode_set_attrib(iq, "from", from);
+    if (to   && *to)   xmlnode_set_attrib(iq, "to", to);
+
+    vcard = xmlnode_new_child(iq, "vCard");
+    xmlnode_set_namespace(vcard, BAREV_VCARD_NS);
+
+    xml = xmlnode_to_str(iq, NULL);
+    xmlnode_free(iq);
+
+    _send_data(pb, xml);
+
+    g_free(xml);
+    g_free(id);
+}
+
+static void
+barev_clear_buddy_icon(PurpleBuddy *pb, BonjourBuddy *bb)
+{
+    PurpleAccount *account;
+    const char *name;
+
+    if (!pb || !bb) return;
+
+    account = purple_buddy_get_account(pb);
+    name = purple_buddy_get_name(pb);
+
+    g_free(bb->phsh);
+    bb->phsh = NULL;
+
+    if (account && name)
+        purple_buddy_icons_set_for_user(account, name, NULL, 0, NULL);
+}
+
+static void
+barev_handle_vcard_result(PurpleBuddy *pb, xmlnode *vcard)
+{
+    BonjourBuddy *bb;
+    xmlnode *photo, *binval;
+    gchar *b64 = NULL;
+    guchar *raw = NULL;
+    gsize raw_len = 0;
+    gchar *sha1 = NULL;
+
+    if (!pb || !vcard) return;
+
+    bb = purple_buddy_get_protocol_data(pb);
+    if (!bb) return;
+
+    photo = xmlnode_get_child(vcard, "PHOTO");
+    if (!photo) {
+        barev_clear_buddy_icon(pb, bb);
+        return;
+    }
+
+    binval = xmlnode_get_child(photo, "BINVAL");
+    if (!binval) {
+        barev_clear_buddy_icon(pb, bb);
+        return;
+    }
+
+    b64 = xmlnode_get_data(binval);
+    if (!b64 || !*b64) {
+        g_free(b64);
+        barev_clear_buddy_icon(pb, bb);
+        return;
+    }
+
+    raw = g_base64_decode(b64, &raw_len);
+    g_free(b64);
+
+    if (!raw || raw_len == 0) {
+        g_free(raw);
+        barev_clear_buddy_icon(pb, bb);
+        return;
+    }
+
+    sha1 = barev_sha1_hex(raw, raw_len);
+    if (sha1) {
+        g_free(bb->phsh);
+        bb->phsh = g_strdup(sha1);
+    }
+
+    bonjour_buddy_got_buddy_icon(bb, raw, raw_len);
+
+    g_free(sha1);
+    g_free(raw);
+}
+
+/* Handle incoming <iq> vCard get/result. Return TRUE if handled. */
+static gboolean
+barev_handle_vcard_iq(xmlnode *packet, PurpleBuddy *pb)
+{
+    const char *type, *id;
+    xmlnode *vcard;
+
+    if (!packet || !pb) return FALSE;
+    if (!purple_strequal(packet->name, "iq")) return FALSE;
+
+    vcard = xmlnode_get_child_with_namespace(packet, "vCard", BAREV_VCARD_NS);
+    if (!vcard) return FALSE;
+
+    type = xmlnode_get_attrib(packet, "type");
+    id   = xmlnode_get_attrib(packet, "id");
+
+    if (type && !g_ascii_strcasecmp(type, "get")) {
+        /* Peer requests our vCard: reply with PHOTO if we have an account icon */
+        PurpleAccount *account = purple_buddy_get_account(pb);
+        const char *from = account ? bonjour_get_jid(account) : "";
+        const char *to   = purple_buddy_get_name(pb);
+
+        PurpleStoredImage *img = NULL;
+        const guchar *data = NULL;
+        gsize len = 0;
+
+        xmlnode *iq = xmlnode_new("iq");
+        xmlnode *out_vcard;
+        gchar *xml;
+
+        xmlnode_set_attrib(iq, "type", "result");
+        if (id && *id) xmlnode_set_attrib(iq, "id", id);
+        if (from && *from) xmlnode_set_attrib(iq, "from", from);
+        if (to   && *to)   xmlnode_set_attrib(iq, "to", to);
+
+        out_vcard = xmlnode_new_child(iq, "vCard");
+        xmlnode_set_namespace(out_vcard, BAREV_VCARD_NS);
+
+        img = (account ? purple_buddy_icons_find_account_icon(account) : NULL);
+        if (img) {
+            data = (const guchar *)purple_imgstore_get_data(img);
+            len  = (gsize)purple_imgstore_get_size(img);
+        }
+
+        if (img && data && len > 0) {
+            gchar *mime = barev_guess_mime_type(data, len);
+            gchar *b64  = g_base64_encode(data, len);
+
+            xmlnode *photo = xmlnode_new_child(out_vcard, "PHOTO");
+
+            if (mime && *mime) {
+                xmlnode *t = xmlnode_new_child(photo, "TYPE");
+                xmlnode_insert_data(t, mime, strlen(mime));
+            }
+
+            if (b64 && *b64) {
+                xmlnode *bv = xmlnode_new_child(photo, "BINVAL");
+                xmlnode_insert_data(bv, b64, strlen(b64));
+            }
+
+            g_free(mime);
+            g_free(b64);
+        }
+
+        if (img)
+            purple_imgstore_unref(img);
+
+        xml = xmlnode_to_str(iq, NULL);
+        xmlnode_free(iq);
+
+        _send_data(pb, xml);
+        g_free(xml);
+
+        return TRUE;
+    }
+
+    if (type && !g_ascii_strcasecmp(type, "result")) {
+        barev_handle_vcard_result(pb, vcard);
+        return TRUE;
+    }
+
+    /* error / set etc: ignore but mark as handled so xfer code doesn't touch it */
+    if (type && (!g_ascii_strcasecmp(type, "error") || !g_ascii_strcasecmp(type, "set")))
+        return TRUE;
+
+    return FALSE;
+}
 static void
 safe_set_buddy_status(PurpleAccount *account, const char *who, const char *status_id,
                       const char *attr_name, const char *attr_value)
@@ -536,7 +820,6 @@ xep_iq_parse(xmlnode *packet, PurpleBuddy *pb)
     xep_bytestreams_parse(gc, packet, pb);
 }
 
-
 static void
 _bonjour_handle_presence(PurpleBuddy *pb, xmlnode *presence_node)
 {
@@ -559,28 +842,14 @@ _bonjour_handle_presence(PurpleBuddy *pb, xmlnode *presence_node)
     if (!account || !name)
         return;
 
-    /* type='unavailable' => offline */
+    /* unavailable => offline */
     type = xmlnode_get_attrib(presence_node, "type");
     if (type && !g_ascii_strcasecmp(type, "unavailable")) {
-        purple_prpl_got_user_status(account, name,
-                                    BONJOUR_STATUS_ID_OFFLINE,
-                                    NULL);
+        safe_set_buddy_status(account, name, BONJOUR_STATUS_ID_OFFLINE, NULL, NULL);
         purple_prpl_got_user_idle(account, name, FALSE, 0);
-
-        if (bb) {
-            g_free(bb->status);
-            bb->status = g_strdup("offline");
-            g_free(bb->msg);
-            bb->msg = NULL;
-        }
-
-        purple_debug_info("bonjour",
-                          "Presence: %s is now offline\n", name);
-
         return;
     }
 
-    /* Get <show> and <status> text children, if present */
     child = xmlnode_get_child(presence_node, "show");
     if (child)
         show_text = xmlnode_get_data(child);
@@ -589,10 +858,8 @@ _bonjour_handle_presence(PurpleBuddy *pb, xmlnode *presence_node)
     if (child)
         status_text = xmlnode_get_data(child);
 
-    /* Map XMPP show -> our two statuses: available/away */
     if (show_text &&
-        (!g_ascii_strcasecmp(show_text, "away") ||
-         !g_ascii_strcasecmp(show_text, "xa"))) {
+        !g_ascii_strcasecmp(show_text, "away")) {
         status_id = BONJOUR_STATUS_ID_AWAY;
     } else if (show_text &&
                !g_ascii_strcasecmp(show_text, "dnd")) {
@@ -608,25 +875,52 @@ _bonjour_handle_presence(PurpleBuddy *pb, xmlnode *presence_node)
         bb->msg = status_text ? g_strdup(status_text) : NULL;
     }
 
-    PurpleStatusType *stype = purple_account_get_status_type(account, status_id);
-    if (!stype) {
-        purple_debug_warning("bonjour",
-            "Presence: %s: unknown status id '%s', falling back to 'available'\n",
-            name, status_id);
-        status_id = BONJOUR_STATUS_ID_AVAILABLE;
+    {
+        PurpleStatusType *stype = purple_account_get_status_type(account, status_id);
+        if (!stype) {
+            purple_debug_warning("bonjour",
+                "Presence: %s: unknown status id '%s', falling back to 'available'\n",
+                name, status_id);
+            status_id = BONJOUR_STATUS_ID_AVAILABLE;
+        }
     }
 
-
     if (status_text) {
-        //purple_prpl_got_user_status(account, name, status_id,
-         //                           "message", status_text, NULL);
         safe_set_buddy_status(account, name, status_id, "message", status_text);
     } else {
-        //purple_prpl_got_user_status(account, name, status_id, NULL);
         safe_set_buddy_status(account, name, status_id, NULL, NULL);
     }
 
     purple_prpl_got_user_idle(account, name, FALSE, 0);
+
+    /* --- Barev: XEP-0153 avatar update in presence --- */
+    if (bb) {
+        xmlnode *x = xmlnode_get_child_with_namespace(presence_node, "x", BAREV_VCARD_UPDATE_NS);
+        if (x) {
+            xmlnode *p = xmlnode_get_child(x, "photo");
+            gchar *new_hash = p ? xmlnode_get_data(p) : NULL;
+
+            if (!new_hash || !*new_hash) {
+                /* Peer says: no avatar */
+                if (new_hash) g_free(new_hash);
+                barev_clear_buddy_icon(pb, bb);
+            } else {
+                if (!bb->phsh || !purple_strequal(bb->phsh, new_hash)) {
+                    purple_debug_info("bonjour",
+                        "Barev: %s avatar hash changed: %s -> %s, requesting vCard\n",
+                        name,
+                        bb->phsh ? bb->phsh : "(none)",
+                        new_hash);
+
+                    g_free(bb->phsh);
+                    bb->phsh = g_strdup(new_hash);
+
+                    barev_send_vcard_get(pb);
+                }
+                g_free(new_hash);
+            }
+        }
+    }
 
     purple_debug_info("bonjour",
                       "Presence: %s show='%s' status='%s'\n",
@@ -876,8 +1170,7 @@ _send_data_write_cb(gpointer data, gint source, PurpleInputCondition cond)
   purple_circ_buffer_mark_read(bconv->tx_buf, ret);
 }
 
-static gint
-_send_data(PurpleBuddy *pb, char *message)
+static gint _send_data(PurpleBuddy *pb, char *message)
 {
   gint ret;
   int len = strlen(message);
@@ -971,7 +1264,8 @@ bonjour_jabber_send_presence(PurpleBuddy *pb,
     from = account ? bonjour_get_jid(account) : NULL;
     if (!from)
         from = "";
-    xmlnode_set_attrib(presence_node, "from", from);
+    if (*from)
+        xmlnode_set_attrib(presence_node, "from", from);
 
     if (!offline && show && *show) {
         child = xmlnode_new_child(presence_node, "show");
@@ -983,6 +1277,9 @@ bonjour_jabber_send_presence(PurpleBuddy *pb,
         xmlnode_insert_data(child, status_msg, strlen(status_msg));
     }
 
+    /* Barev: XEP-0153 avatar hash advertisement */
+    barev_presence_add_avatar_update(presence_node, account);
+
     xml = xmlnode_to_str(presence_node, NULL);
     xmlnode_free(presence_node);
 
@@ -993,52 +1290,52 @@ bonjour_jabber_send_presence(PurpleBuddy *pb,
     return ret;
 }
 
-
-
 void
-bonjour_jabber_process_packet(PurpleBuddy *pb, xmlnode *packet) {
-   if (!packet) {
-    purple_debug_error("bonjour", "process_packet: NULL packet\n");
-    return;
-  }
-
-  if (!pb) {
-    purple_debug_error("bonjour", "process_packet: NULL buddy\n");
-    return;
-  }
-
-  //g_return_if_fail(packet != NULL);
-  //g_return_if_fail(pb != NULL);
-
-  BonjourBuddy *bb = purple_buddy_get_protocol_data(pb);
-  if (bb && bb->conversation) {
-    bb->conversation->last_activity = time(NULL);
-  }
-
-  if (purple_strequal(packet->name, "message")) {
-    _jabber_parse_and_write_message_to_ui(packet, pb);
-  } else if (purple_strequal(packet->name, "iq")) {
-    /* Check for ping first */
-    if (bb && bb->conversation) {
-      if (bonjour_jabber_handle_ping(packet, bb->conversation)) {
-        /* Ping handled, don't process further */
+bonjour_jabber_process_packet(PurpleBuddy *pb, xmlnode *packet)
+{
+    if (!packet) {
+        purple_debug_error("bonjour", "process_packet: NULL packet\n");
         return;
-      }
-
-      /* Check for ping response */
-      bonjour_jabber_handle_ping_response(packet, bb->conversation);
     }
 
-    /* Process other IQ packets */
-    xep_iq_parse(packet, pb);
-  } else if (purple_strequal(packet->name, "presence")) {
-    _bonjour_handle_presence(pb, packet);
-  } else {
-    purple_debug_warning("bonjour", "Unknown packet: %s\n",
-      packet->name ? packet->name : "(null)");
-  }
-}
+    if (!pb) {
+        purple_debug_error("bonjour", "process_packet: NULL buddy\n");
+        return;
+    }
 
+    BonjourBuddy *bb = purple_buddy_get_protocol_data(pb);
+    if (bb && bb->conversation) {
+        bb->conversation->last_activity = time(NULL);
+    }
+
+    if (purple_strequal(packet->name, "message")) {
+        _jabber_parse_and_write_message_to_ui(packet, pb);
+
+    } else if (purple_strequal(packet->name, "iq")) {
+        /* Ping first */
+        if (bb && bb->conversation) {
+            if (bonjour_jabber_handle_ping(packet, bb->conversation)) {
+                return; /* handled */
+            }
+            bonjour_jabber_handle_ping_response(packet, bb->conversation);
+        }
+
+        /* Barev: vCard avatars */
+        if (barev_handle_vcard_iq(packet, pb)) {
+            return;
+        }
+
+        /* Existing SI / bytestreams handling */
+        xep_iq_parse(packet, pb);
+
+    } else if (purple_strequal(packet->name, "presence")) {
+        _bonjour_handle_presence(pb, packet);
+
+    } else {
+        purple_debug_warning("bonjour", "Unknown packet: %s\n",
+                             packet->name ? packet->name : "(null)");
+    }
+}
 
 void
 bonjour_jabber_stream_ended(BonjourJabberConversation *bconv)

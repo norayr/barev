@@ -1633,34 +1633,42 @@ bonjour_get_info(PurpleConnection *gc, const char *who)
 {
     PurpleAccount *account;
     PurpleBuddy *pb;
-    BonjourBuddy *bb;
+    BonjourBuddy *bb = NULL;
     PurpleNotifyUserInfo *info;
 
-    if (!gc || !who) return;
+    if (!gc || !who)
+        return;
 
     account = purple_connection_get_account(gc);
     pb = purple_find_buddy(account, who);
+    if (pb)
+        bb = purple_buddy_get_protocol_data(pb);
 
+    /*
+     * If we have a live stream, do NOT show a "minimal" window first.
+     * Ask for vCard and the vCard result handler will show the userinfo popup
+     * (which we now augment with the <img> avatar).
+     */
+    if (pb && bb && bb->conversation && bb->conversation->socket >= 0) {
+        bonjour_jabber_request_vcard(pb, TRUE);
+        return;
+    }
+
+    /* No stream: show whatever we know locally */
     info = purple_notify_user_info_new();
     purple_notify_user_info_add_pair_plaintext(info, "JID", who);
 
-    if (pb && (bb = purple_buddy_get_protocol_data(pb)) != NULL) {
+    if (bb) {
         if (bb->status)
             purple_notify_user_info_add_pair_plaintext(info, "Show", bb->status);
         if (bb->msg)
             purple_notify_user_info_add_pair_plaintext(info, "Status", bb->msg);
+        if (bb->phsh)
+            purple_notify_user_info_add_pair_plaintext(info, "Avatar SHA1", bb->phsh);
     }
 
     purple_notify_userinfo(gc, who, info, NULL, NULL);
     purple_notify_user_info_destroy(info);
-
-    /* If we have a live stream, request vCard and show richer info when it returns */
-    if (pb && bb && bb->conversation && bb->conversation->socket >= 0) {
-        bonjour_jabber_request_vcard(pb, TRUE);
-    } else {
-        purple_debug_info("bonjour", "Get Info: no active stream for %s, skipping vCard fetch\n", who);
-    }
 }
-
 
 PURPLE_INIT_PLUGIN(bonjour, init_plugin, info);

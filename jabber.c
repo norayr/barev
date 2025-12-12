@@ -68,6 +68,10 @@
 #include "bonjour_ft.h"
 #include "libpurple/server.h"
 
+#include "buddyicon.h"
+#include "notify.h"
+#include "imgstore.h"
+
 #ifdef _SIZEOF_ADDR_IFREQ
 #  define HX_SIZE_OF_IFREQ(a) _SIZEOF_ADDR_IFREQ(a)
 #else
@@ -95,7 +99,10 @@ static gint _send_data(PurpleBuddy *pb, char *message);
 static gchar * barev_make_iq_id(const char *prefix);
 static void _jabber_parse_and_write_message_to_ui(xmlnode *message_node, PurpleBuddy *pb);
 static void _bonjour_handle_presence(PurpleBuddy *pb, xmlnode *presence_node);
-
+typedef struct {
+    PurpleNotifyUserInfo *info;
+    int avatar_img_id; /* 0 if none */
+} BarevUserInfoCloseData;
 
 enum sent_stream_start_types {
   NOT_SENT       = 0,
@@ -107,6 +114,97 @@ typedef struct {
     PurpleAccount *account;
     char *who;
 } BarevVcardReq;
+
+static void
+barev_userinfo_close_cb(gpointer user_data)
+{
+    BarevUserInfoCloseData *d = (BarevUserInfoCloseData *)user_data;
+    if (!d) return;
+
+    if (d->avatar_img_id > 0)
+        purple_imgstore_unref_by_id(d->avatar_img_id);
+
+    if (d->info)
+        purple_notify_user_info_destroy(d->info);
+
+    g_free(d);
+}
+
+/*
+ * Add avatar from a parsed <vCard/> into a PurpleNotifyUserInfo popup.
+ * Returns imgstore id (caller must unref later), or 0 if no avatar.
+ */
+static int
+barev_userinfo_add_avatar(PurpleNotifyUserInfo *info, xmlnode *vcard)
+{
+    xmlnode *photo, *binval, *type_node;
+    gchar *b64 = NULL;
+    guchar *raw = NULL;
+    gsize raw_len = 0;
+    gchar *type_s = NULL;
+    gchar *filename = NULL;
+    gchar *html = NULL;
+    int img_id = 0;
+
+    if (!info || !vcard)
+        return 0;
+
+    photo = xmlnode_get_child(vcard, "PHOTO");
+    if (!photo)
+        return 0;
+
+    binval = xmlnode_get_child(photo, "BINVAL");
+    if (!binval)
+        return 0;
+
+    b64 = xmlnode_get_data(binval);
+    if (!b64 || !*b64) {
+        g_free(b64);
+        return 0;
+    }
+
+    raw = g_base64_decode(b64, &raw_len);
+    g_free(b64);
+
+    if (!raw || raw_len == 0) {
+        g_free(raw);
+        return 0;
+    }
+
+    /* Optional MIME type, e.g. image/jpeg */
+    type_node = xmlnode_get_child(photo, "TYPE");
+    if (type_node)
+        type_s = xmlnode_get_data(type_node);
+
+    /* Filename is just “for convenience” in imgstore */
+    if (type_s && g_str_has_prefix(type_s, "image/")) {
+        filename = g_strdup_printf("barev-avatar.%s", type_s + 6);
+    } else {
+        filename = g_strdup("barev-avatar");
+    }
+
+    /* Takes ownership of raw on success; caller owns a ref by id and must unref */
+    img_id = purple_imgstore_add_with_id(raw, raw_len, filename);
+    g_free(filename);
+    g_free(type_s);
+
+    if (img_id <= 0) {
+        /* If add_with_id failed, it did NOT take ownership */
+        g_free(raw);
+        return 0;
+    }
+
+    /*
+     * IMPORTANT: Pidgin turns <img ...> without id into a link.
+     * So we embed <img id="..."> referencing imgstore.
+     */
+    html = g_strdup_printf("<img id=\"%d\" alt=\"avatar\"/>", img_id);
+
+    purple_notify_user_info_add_pair(info, "Avatar", html);
+    g_free(html);
+
+    return img_id;
+}
 
 static void barev_vcard_req_free(BarevVcardReq *r)
 {
@@ -466,8 +564,17 @@ barev_handle_vcard_iq(xmlnode *packet, PurpleBuddy *pb)
                         purple_notify_user_info_add_pair_plaintext(info, "Avatar SHA1", bb->phsh);
                 }
 
-                purple_notify_userinfo(gc, r->who, info, NULL, NULL);
-                purple_notify_user_info_destroy(info);
+                //purple_notify_userinfo(gc, r->who, info, NULL, NULL);
+                //purple_notify_user_info_destroy(info);
+                int avatar_id = 0;
+                BarevUserInfoCloseData *cd = NULL;
+                avatar_id = barev_userinfo_add_avatar(info, vcard);
+
+                cd = g_new0(BarevUserInfoCloseData, 1);
+                cd->info = info;
+                cd->avatar_img_id = avatar_id;
+
+                purple_notify_userinfo(gc, r->who, info, barev_userinfo_close_cb, cd);
 
                 g_free(fn);
 

@@ -60,10 +60,15 @@ Currently, if you want to change your contact's port, you need to
 
 * p2p Serverless Messaging (XEP-0174) - This is the core protocol for serverless (peer-to-peer) XMPP. However, note that Barev uses a version without full XEP-0174, but the idea is similar, the MDNS parts are replaced with the XEPs below.
 **  Messaging like described in Core XMPP (RFC 6120 and RFC 6121)
+
 *** Stream management (the stream:stream opening and closing, and the basic stanza exchange).
+
 *** Presence stanzas for status.
+
 *** Message stanzas for chat.
+
 * XMPP pings (XEP-0199) - Used for ping/pong to keep the connection alive and check availability.
+
 * file transfers based on
 ** Stream initiation(XEP-0095) - Used for initiating the file transfer stream.
 ** SI File Transfer (XEP-0096) - Used for the actual file transfer over the stream.

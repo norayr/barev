@@ -1400,6 +1400,48 @@ static gint _send_data(PurpleBuddy *pb, char *message)
   return ret;
 }
 
+static void
+barev_send_current_presence_to_buddy(PurpleBuddy *pb)
+{
+    PurpleAccount *account;
+    PurpleStatus *status;
+    PurpleStatusType *stype;
+    const char *id;
+    const char *message;
+    gchar *stripped;
+    const char *show = NULL;
+    gboolean offline = FALSE;
+
+    if (!pb) return;
+
+    account = purple_buddy_get_account(pb);
+    if (!account) return;
+
+    status = purple_account_get_active_status(account);
+    if (!status) return;
+
+    stype = purple_status_get_type(status);
+    id = stype ? purple_status_type_get_id(stype) : NULL;
+
+    if (id && g_strcmp0(id, BONJOUR_STATUS_ID_OFFLINE) == 0) {
+        offline = TRUE;
+    } else if (id && g_strcmp0(id, BONJOUR_STATUS_ID_AWAY) == 0) {
+        show = "away";
+    } else if (id && g_strcmp0(id, BONJOUR_STATUS_ID_BUSY) == 0) {
+        show = "dnd";
+    } else {
+        show = NULL;
+    }
+
+    message = purple_status_get_attr_string(status, "message");
+    if (!message) message = "";
+    stripped = purple_markup_strip_html(message);
+
+    bonjour_jabber_send_presence(pb, show, stripped, offline);
+
+    g_free(stripped);
+}
+
 int
 bonjour_jabber_send_presence(PurpleBuddy *pb,
                              const char *show,
@@ -1466,53 +1508,6 @@ bonjour_jabber_send_presence(PurpleBuddy *pb,
 
     return ret;
 }
-
-//void
-//bonjour_jabber_process_packet(PurpleBuddy *pb, xmlnode *packet)
-//{
-//    if (!packet) {
-//        purple_debug_error("bonjour", "process_packet: NULL packet\n");
-//        return;
-//    }
-//
-//    if (!pb) {
-//        purple_debug_error("bonjour", "process_packet: NULL buddy\n");
-//        return;
-//    }
-//
-//    BonjourBuddy *bb = purple_buddy_get_protocol_data(pb);
-//    if (bb && bb->conversation) {
-//        bb->conversation->last_activity = time(NULL);
-//    }
-//
-//    if (purple_strequal(packet->name, "message")) {
-//        _jabber_parse_and_write_message_to_ui(packet, pb);
-//
-//    } else if (purple_strequal(packet->name, "iq")) {
-//        /* Ping first */
-//        if (bb && bb->conversation) {
-//            if (bonjour_jabber_handle_ping(packet, bb->conversation)) {
-//                return; /* handled */
-//            }
-//            bonjour_jabber_handle_ping_response(packet, bb->conversation);
-//        }
-//
-//        /* Barev: vCard avatars */
-//        if (barev_handle_vcard_iq(packet, pb)) {
-//            return;
-//        }
-//
-//        /* Existing SI / bytestreams handling */
-//        xep_iq_parse(packet, pb);
-//
-//    } else if (purple_strequal(packet->name, "presence")) {
-//        _bonjour_handle_presence(pb, packet);
-//
-//    } else {
-//        purple_debug_warning("bonjour", "Unknown packet: %s\n",
-//                             packet->name ? packet->name : "(null)");
-//    }
-//}
 
 void
 bonjour_jabber_stream_ended(BonjourJabberConversation *bconv)
@@ -1790,6 +1785,9 @@ void bonjour_jabber_stream_started(BonjourJabberConversation *bconv) {
       /* We can probably write the data right now. */
       _send_data_write_cb(bconv->pb, bconv->socket, PURPLE_INPUT_WRITE);
     }
+
+    barev_send_current_presence_to_buddy(pb);
+
   }
 }
 

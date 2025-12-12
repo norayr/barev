@@ -36,6 +36,9 @@
 #include "bonjour_ft.h"
 #include "cipher.h"
 
+#define BAREV_FT_PORT_MIN 50000
+#define BAREV_FT_PORT_MAX 50049
+
 static void
 bonjour_bytestreams_init(PurpleXfer *xfer);
 static void
@@ -1011,14 +1014,36 @@ bonjour_bytestreams_init(PurpleXfer *xfer)
     memset(&addr6, 0, sizeof(addr6));
     addr6.sin6_family = AF_INET6;
     addr6.sin6_addr = in6addr_any;   /* listen on all IPv6 addresses */
-    addr6.sin6_port = 0;             /* let kernel choose port */
+    //addr6.sin6_port = 0;             /* let kernel choose port */
 
-    if (bind(sock, (struct sockaddr *)&addr6, sizeof(addr6)) < 0) {
-        purple_debug_error("bonjour", "Barev: bind() failed for bytestream: %s\n",
-                           g_strerror(errno));
-        close(sock);
-        purple_xfer_cancel_local(xfer);
-        return;
+    //if (bind(sock, (struct sockaddr *)&addr6, sizeof(addr6)) < 0) {
+    //    purple_debug_error("bonjour", "Barev: bind() failed for bytestream: %s\n",
+    //                       g_strerror(errno));
+    //    close(sock);
+    //    purple_xfer_cancel_local(xfer);
+    //    return;
+    //}
+
+    gboolean bound = FALSE;
+    int p;
+
+    for (p = BAREV_FT_PORT_MIN; p <= BAREV_FT_PORT_MAX; p++) {
+        addr6.sin6_port = htons((guint16)p);
+        if (bind(sock, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
+            bound = TRUE;
+            break;
+        }
+    }
+    /* fallback: random ephemeral port if the whole range is busy */
+    if (!bound) {
+        addr6.sin6_port = 0; /* kernel chooses */
+        if (bind(sock, (struct sockaddr *)&addr6, sizeof(addr6)) < 0) {
+            purple_debug_error("bonjour", "Barev: bind() failed for bytestream: %s\n",
+                               g_strerror(errno));
+            close(sock);
+            purple_xfer_cancel_local(xfer);
+            return;
+        }
     }
 
     if (listen(sock, 1) < 0) {

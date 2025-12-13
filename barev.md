@@ -197,33 +197,32 @@ YOUR CLIENT                                BUDDY'S CLIENT
 ---
 
 ## Protocol State Machine
-
 ```
 START
   |
-  |---[Listen on 5299]---[Incoming connection]---[Receive stream header]
-  |                         |                           |
-  |                         |                    [Send stream response]
-  |                         |                           |
-  |                         |                    [Exchange presence]
-  |                         |                           |
-  |                         |                    [Chat phase]
-  |                         |                           |
-  |---[Connect to buddy]---[Send stream header]---[Wait for response]
-  |                         |                           |
-  |                         |                    [Exchange presence]
-  |                         |                           |
-  |                         |                    [Chat phase]
-  |                         |                           |
+  |---[Create LISTENER socket on 5299]---[Incoming connection]---[Accept, create PIPE]
+  |        (Server role)                          |                           |
+  |                                              |                    [Send stream response]
+  |                                              |                           |
+  |                                              |                    [Exchange presence]
+  |                                              |                           |
+  |                                              |                    [Chat phase]
+  |                                              |                           |
+  |---[Create CLIENT socket (random port)]---[Connect to buddy:5299]---[Send stream header]
+  |        (Client role)                              |                           |
+  |                                              [Wait for response]---[Exchange presence]
+  |                                                                          |
+  |                                                                   [Chat phase]
+  |
   |---[Periodic ping]---->[If no response in 10s]---[Fail counter++]
   |                         |                           |
   |                         |                    [If fails >= 3: mark offline]
   |                         |                           |
-  |---[Send message]----->[If pipe dead]---[Try reconnect]
+  |---[Send message]----->[If PIPE dead]---[Try reconnect (new client socket)]
   |                         |                           |
-  |                         |                    [If success: resume]
+  |                         |                    [If success: new PIPE]
   |                         |                           |
-  |---[Receive </stream:stream>]---[Close socket]---[Mark buddy offline]
+  |---[Receive </stream:stream>]---[Close PIPE socket]---[Mark buddy offline]
   |
 END
 ```
@@ -242,19 +241,35 @@ END
 - TCP guarantees in-order delivery
 - No need for message IDs for ordering (but ping uses them)
 
-### 3. Error Handling
+### 3. Port Architecture
+
+Barev uses a traditional client-server socket model:
+
+| Component | Local Port | Remote Port | Purpose |
+|-----------|------------|-------------|---------|
+| **Listener** | 5299 (fixed) | N/A | Accepts incoming connections |
+| **Outgoing Connection** | Random (OS-chosen) | 5299 | Initiates connection to buddy |
+| **Established Pipe** | Depends on who connected: <br>• If you connected: Random <br>• If buddy connected: 5299 | Opposite of local | All bidirectional communication |
+
+**Key Insight**: The "pipe" is just the established TCP connection, which uses:
+- Your listening port (5299) if buddy connected to you
+- Your random outgoing port if you connected to buddy
+
+**No Dual-Role Sockets**: Unlike some P2P protocols, Barev does NOT use a single socket that both listens and connects. Instead, it maintains separate sockets for listening and connecting.
+
+### 4. Error Handling
 - Socket errors = close connection, mark buddy offline
 - XML parse errors = log, but keep connection alive
 - Unknown stanza types = log warning, ignore
 
-### 4. Concurrent Connections
+### 5. Concurrent Connections
 - Only one active connection per buddy
 - If new connection arrives for same buddy:
   - Close old connection (if exists)
   - Accept new connection
   - Update buddy's IP if different
 
-### 5. Buddy Matching Logic
+### 6. Buddy Matching Logic
 The protocol matches buddies by:
 1. **Exact JID match** (preferred)
 2. **IP address match** (last resort)
@@ -294,10 +309,10 @@ yggdrasilctl getSelf
 
 ### Connection:
 ```bash
-# Listen
+# Listen (binds to port 5299, accepts incoming connections)
 nc -6 -l -p 5299
 
-# Connect
+# Connect (creates new socket with random port, connects to buddy's port 5299)
 nc -6 BUDDY_IP 5299
 ```
 
@@ -336,7 +351,12 @@ nc -6 BUDDY_IP 5299
 ## For Client Developers
 
 ### Required Implementation:
-1. **Dual-role socket**: Both listen AND connect capability
+1. **Dual-capability**: Both listen AND connect but using separate sockets:
+
+- **Listening socket**: Binds to port 5299 to accept incoming connections
+   - **Connecting sockets**: Create new sockets with random ports to initiate outgoing connections
+   - **Established pipe**: Whichever connection succeeds first becomes the single bidirectional pipe
+
 2. **Buddy state tracking**: Track `conversation` pointer per buddy
 3. **Auto-reconnect**: Attempt reconnect on connection loss
 4. **Ping/pong**: 30-second keepalive with 10-second timeout
@@ -387,6 +407,8 @@ Use freely for Yggdrasil-based messaging applications. When implementing, please
 
 ## Appendix
 Example:
+
+** When you listen **
 
 I ran mc to listen on 5299
 

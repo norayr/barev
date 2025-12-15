@@ -50,7 +50,6 @@
 #include <errno.h>
 #include <sys/socket.h>
 
-#define BAREV_CHATSTATE_TIMEOUT_SECONDS 4
 
 
 typedef struct {

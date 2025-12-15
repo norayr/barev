@@ -745,11 +745,16 @@ static gchar* generate_ping_id(void) {
 static gboolean bonjour_jabber_ping_timeout_cb(gpointer data) {
   BonjourJabberConversation *bconv = data;
 
-  if (!bconv || !bconv->pb) {
+  if (!bconv) {
     return FALSE;
   }
 
   bconv->ping_response_timer = 0;
+
+  if (!bconv->pb) {
+    return FALSE;
+  }
+
   bconv->ping_failures++;
 
   purple_debug_warning("bonjour", "Ping timeout for %s (failures: %d)\n",
@@ -3093,6 +3098,7 @@ void bonjour_jabber_send_ping_request(BonjourJabberConversation *bconv) {
   /* Start response timeout timer */
   if (bconv->ping_response_timer) {
     purple_timeout_remove(bconv->ping_response_timer);
+    bconv->ping_response_timer = 0;
   }
   bconv->ping_response_timer = purple_timeout_add_seconds(PING_TIMEOUT,
                                                          bonjour_jabber_ping_timeout_cb,

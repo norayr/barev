@@ -2363,29 +2363,6 @@ bonjour_jabber_conv_match_by_name(BonjourJabberConversation *bconv)
     bconv->pb = pb;
     bb->conversation = bconv;
 
-        /* If we matched based on the stream "from" attribute rather than IP,
-     * add the connection IP to the buddy's IP list so validation passes */
-    if (bconv->ip && bb->ips) {
-        gboolean ip_found = FALSE;
-        GSList *ip_iter = bb->ips;
-        while (ip_iter) {
-            if (g_strcmp0(ip_iter->data, bconv->ip) == 0) {
-                ip_found = TRUE;
-                break;
-            }
-            ip_iter = ip_iter->next;
-        }
-
-        if (!ip_found) {
-            purple_debug_info("bonjour",
-                "Adding connection IP %s to buddy %s's IP list (matched by stream 'from')\n",
-                bconv->ip, purple_buddy_get_name(pb));
-            bb->ips = g_slist_append(bb->ips, g_strdup(bconv->ip));
-        }
-    }
-
-
-
     if (bconv->pb != NULL) {
     /* Validate IP consistency */
     if (!validate_ip_consistency(bconv, purple_buddy_get_name(bconv->pb))) {

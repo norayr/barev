@@ -3201,27 +3201,7 @@ gboolean bonjour_jabber_handle_ping(xmlnode *packet, BonjourJabberConversation *
 
       purple_debug_info("bonjour", "Responded to ping from %s\n",
                        xmlnode_get_attrib(packet, "from"));
-      const char *from = xmlnode_get_attrib(packet, "from");
 
-      if (from && bconv && bconv->pb) {
-        PurpleAccount *acct = purple_buddy_get_account(bconv->pb);
-
-        /* match by full buddy name */
-        PurpleBuddy *real_pb = purple_find_buddy(acct, from);
-        if (real_pb) {
-            const char *who = purple_buddy_get_name(real_pb);
-
-            purple_debug_info("bonjour", "Barev: ping from=%s mapped to buddy=%s\n",
-                              from, who);
-
-            purple_prpl_got_user_status(acct, who, BONJOUR_STATUS_ID_AVAILABLE, NULL);
-
-            if (bconv)
-                bconv->recv_stream_start = TRUE;
-        } else {
-            purple_debug_warning("bonjour", "Barev: ping from=%s but no buddy found with that name\n", from);
-        }
-    }
       /* Proof of life: if they can ping us, they are online. */
       if (bconv->pb) {
           PurpleAccount *acct = purple_buddy_get_account(bconv->pb);

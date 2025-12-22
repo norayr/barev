@@ -958,7 +958,8 @@ bonjour_find_buddy_by_localpart(PurpleAccount *account, const char *jid)
     const char *at;
     gchar *local = NULL;
     PurpleBlistNode *gnode, *cnode, *bnode;
-    PurpleBuddy *buddy = NULL;
+    PurpleBuddy *found = NULL;
+    int matches = 0;
 
     if (!account || !jid)
         return NULL;
@@ -981,6 +982,7 @@ bonjour_find_buddy_by_localpart(PurpleAccount *account, const char *jid)
                 continue;
 
             for (bnode = cnode->child; bnode; bnode = bnode->next) {
+                PurpleBuddy *buddy;
                 const char *name;
 
                 if (!PURPLE_BLIST_NODE_IS_BUDDY(bnode))
@@ -995,24 +997,36 @@ bonjour_find_buddy_by_localpart(PurpleAccount *account, const char *jid)
                 if (!name)
                     continue;
 
-                /* Look for "local@" prefix, e.g. "inky@" */
-                if (g_str_has_prefix(name, local) &&
-                    name[strlen(local)] == '@') {
-
-                    purple_debug_info("bonjour",
-                        "bonjour_find_buddy_by_localpart: '%s' -> '%s'\n",
-                        jid, name);
-
-                    g_free(local);
-                    return buddy;
+                /* Look for "local@" prefix */
+                if (g_str_has_prefix(name, local) && name[strlen(local)] == '@') {
+                    matches++;
+                    if (matches == 1) {
+                        found = buddy;
+                    } else {
+                        /* Ambiguous: more than one buddy shares the same localpart */
+                        purple_debug_warning("bonjour",
+                            "bonjour_find_buddy_by_localpart: ambiguous localpart '%s' for '%s' (at least '%s' and '%s')\n",
+                            local, jid,
+                            found ? purple_buddy_get_name(found) : "(null)",
+                            name);
+                        g_free(local);
+                        return NULL;
+                    }
                 }
             }
         }
     }
 
+    if (found) {
+        purple_debug_info("bonjour",
+            "bonjour_find_buddy_by_localpart: '%s' -> '%s'\n",
+            jid, purple_buddy_get_name(found));
+    }
+
     g_free(local);
-    return NULL;
+    return found;
 }
+
 void
 bonjour_jabber_process_packet(PurpleBuddy *pb, xmlnode *packet)
 {
@@ -2246,41 +2260,69 @@ bonjour_jabber_conv_match_by_name(BonjourJabberConversation *bconv)
         return;
     }
 
-    /* 1) Try exact name match first (e.g. "inky@201:...") */
     pb = purple_find_buddy(account, bconv->buddy_name);
+
     if (!pb) {
         purple_debug_info("bonjour",
                           "conv_match_by_name: no buddy named '%s'\n",
-                          bconv->buddy_name);
+                          bconv->buddy_name ? bconv->buddy_name : "(null)");
 
-        /* 2) Barev-style fallback: match by localpart ("inky@barev.local" -> "inky@201:...") */
+        /* 2) Barev-style fallback: localpart match, but only if UNIQUE. */
         pb = bonjour_find_buddy_by_localpart(account, bconv->buddy_name);
+
         if (!pb) {
             purple_debug_info("bonjour",
-                              "conv_match_by_name: no buddy with localpart of '%s'\n",
-                              bconv->buddy_name);
-
-            /* 3) No name match at all – try IP matching instead. */
-            purple_debug_warning("bonjour",
-                "conv_match_by_name: no buddy named/localpart '%s'; trying IP match for %s\n",
+                "conv_match_by_name: no unique buddy named/localpart '%s'; trying IP match for %s\n",
                 bconv->buddy_name ? bconv->buddy_name : "(null)",
                 bconv->ip ? bconv->ip : "(no ip)");
 
+            /* 3) IP match */
             bonjour_jabber_conv_match_by_ip(bconv);
-            return;
+            pb = bconv->pb;
         }
     }
+
+    /* If still nothing, we cannot attach this conversation. */
+    if (!pb) {
+        purple_debug_warning("bonjour",
+            "conv_match_by_name: unable to match conversation (buddy_name='%s', ip='%s')\n",
+            bconv->buddy_name ? bconv->buddy_name : "(null)",
+            bconv->ip ? bconv->ip : "(no ip)");
+        return;
+    }
+
+    /* Attach the buddy to this conversation (whatever your code does next). */
+    bconv->pb = pb;
 
     /* We have a PurpleBuddy – get its BonjourBuddy data. */
     bb = purple_buddy_get_protocol_data(pb);
     if (!bb) {
         purple_debug_warning("bonjour",
-                             "conv_match_by_name: buddy '%s' has no protocol data\n",
+                             "conv_match_by_name: buddy '%s' has no protocol data; trying IP match\n",
                              purple_buddy_get_name(pb));
-        /* No protocol data – we can’t really attach; fall back to IP. */
+
+        /* Fall back to IP match */
         bonjour_jabber_conv_match_by_ip(bconv);
-        return;
+        pb = bconv->pb;
+
+        if (!pb) {
+            purple_debug_warning("bonjour",
+                                 "conv_match_by_name: IP match failed after missing protocol data\n");
+            return;
+        }
+
+        bb = purple_buddy_get_protocol_data(pb);
+        if (!bb) {
+            purple_debug_warning("bonjour",
+                                 "conv_match_by_name: IP-matched buddy '%s' still has no protocol data\n",
+                                 purple_buddy_get_name(pb));
+            return;
+        }
+
+        /* Ensure conversation points at the new pb */
+        bconv->pb = pb;
     }
+
 
     purple_debug_info("bonjour",
                       "Matched buddy %s to incoming conversation \"from\" attrib "
@@ -2299,6 +2341,30 @@ bonjour_jabber_conv_match_by_name(BonjourJabberConversation *bconv)
 
     bconv->pb = pb;
     bb->conversation = bconv;
+
+        /* If we matched based on the stream "from" attribute rather than IP,
+     * add the connection IP to the buddy's IP list so validation passes */
+    if (bconv->ip && bb->ips) {
+        gboolean ip_found = FALSE;
+        GSList *ip_iter = bb->ips;
+        while (ip_iter) {
+            if (g_strcmp0(ip_iter->data, bconv->ip) == 0) {
+                ip_found = TRUE;
+                break;
+            }
+            ip_iter = ip_iter->next;
+        }
+
+        if (!ip_found) {
+            purple_debug_info("bonjour",
+                "Adding connection IP %s to buddy %s's IP list (matched by stream 'from')\n",
+                bconv->ip, purple_buddy_get_name(pb));
+            bb->ips = g_slist_append(bb->ips, g_strdup(bconv->ip));
+        }
+    }
+
+
+
     if (bconv->pb != NULL) {
     /* Validate IP consistency */
     if (!validate_ip_consistency(bconv, purple_buddy_get_name(bconv->pb))) {
@@ -3137,6 +3203,41 @@ gboolean bonjour_jabber_handle_ping(xmlnode *packet, BonjourJabberConversation *
 
       purple_debug_info("bonjour", "Responded to ping from %s\n",
                        xmlnode_get_attrib(packet, "from"));
+      const char *from = xmlnode_get_attrib(packet, "from");
+
+      if (from && bconv && bconv->pb) {
+        PurpleAccount *acct = purple_buddy_get_account(bconv->pb);
+
+        /* match by full buddy name */
+        PurpleBuddy *real_pb = purple_find_buddy(acct, from);
+        if (real_pb) {
+            const char *who = purple_buddy_get_name(real_pb);
+
+            purple_debug_info("bonjour", "Barev: ping from=%s mapped to buddy=%s\n",
+                              from, who);
+
+            purple_prpl_got_user_status(acct, who, BONJOUR_STATUS_ID_AVAILABLE, NULL);
+
+            if (bconv)
+                bconv->recv_stream_start = TRUE;
+        } else {
+            purple_debug_warning("bonjour", "Barev: ping from=%s but no buddy found with that name\n", from);
+        }
+    }
+      /* Proof of life: if they can ping us, they are online. */
+      if (bconv->pb) {
+          PurpleAccount *acct = purple_buddy_get_account(bconv->pb);
+          const char *who = purple_buddy_get_name(bconv->pb);
+
+          bconv->last_activity = time(NULL);
+          bconv->ping_failures = 0;
+
+          /* This fixes your “pending conversation (no stream yet)” gate too */
+          bconv->recv_stream_start = TRUE;
+
+          purple_prpl_got_user_status(acct, who, BONJOUR_STATUS_ID_AVAILABLE, NULL);
+      }
+
       return TRUE;
     }
   }

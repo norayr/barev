@@ -39,7 +39,36 @@ parse_from_attrib_and_find_buddy(BonjourJabberConversation *bconv, int nb_attrib
 	for(i=0; i < nb_attributes * 5; i+=5) {
 		if(!xmlStrcmp(attributes[i], (xmlChar*) "from")) {
 			int len = attributes[i+4] - attributes[i+3];
-			bconv->buddy_name = g_strndup((char *)attributes[i+3], len);
+			char *from_jid = g_strndup((char *)attributes[i+3], len);
+			
+			/* If we already have a buddy attached, check if the "from" matches */
+			if (bconv->pb != NULL) {
+				const char *current_buddy_name = purple_buddy_get_name(bconv->pb);
+				
+				if (g_strcmp0(current_buddy_name, from_jid) != 0) {
+					purple_debug_warning("bonjour",
+						"Stream 'from=%s' doesn't match connected buddy '%s'. "
+						"Trying to find correct buddy.\n",
+						from_jid, current_buddy_name);
+					
+					/* Clear the old buddy association */
+					BonjourBuddy *bb = purple_buddy_get_protocol_data(bconv->pb);
+					if (bb && bb->conversation == bconv) {
+						bb->conversation = NULL;
+					}
+					bconv->pb = NULL;
+				} else {
+					/* "from" matches our current buddy, all good */
+					purple_debug_info("bonjour",
+						"Stream 'from=%s' matches current buddy.\n", from_jid);
+					g_free(from_jid);
+					return TRUE;
+				}
+			}
+			
+			/* Set the buddy_name from the "from" attribute and try to match */
+			g_free(bconv->buddy_name);
+			bconv->buddy_name = from_jid;
 			bonjour_jabber_conv_match_by_name(bconv);
 
 			return (bconv->pb != NULL);
@@ -66,8 +95,8 @@ bonjour_parser_element_start_libxml(void *user_data,
 		if(!bconv->recv_stream_start) {
 			bconv->recv_stream_start = TRUE;
 
-			if (bconv->pb == NULL)
-				parse_from_attrib_and_find_buddy(bconv, nb_attributes, attributes);
+			/* Always parse and validate the "from" attribute, even if we already have a buddy */
+			parse_from_attrib_and_find_buddy(bconv, nb_attributes, attributes);
 
 			bonjour_jabber_stream_started(bconv);
 		}
@@ -229,4 +258,3 @@ void bonjour_parser_process(BonjourJabberConversation *bconv, const char *buf, i
 		purple_debug_error("bonjour", "Error parsing xml.\n");
 
 }
-

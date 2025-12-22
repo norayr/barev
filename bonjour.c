@@ -456,15 +456,6 @@ static void barev_save_contact(BonjourBuddy *bb)
                         : "";
     int port        = bb->port_p2pj;
 
-    /* Localpart "inky" from "inky@201:..." */
-    const char *at = strchr(jid, '@');
-    char *localpart;
-
-    if (at && at != jid)
-        localpart = g_strndup(jid, (gsize)(at - jid));
-    else
-        localpart = g_strdup(jid);
-
     /* Read existing file, rewrite in memory, then overwrite */
     if (g_file_get_contents(filename, &contents, &len, NULL)) {
         lines = g_strsplit(contents, "\n", 0);
@@ -473,8 +464,6 @@ static void barev_save_contact(BonjourBuddy *bb)
             char *line = lines[i];
             char *line_trimmed;
             char **parts;
-            char *existing_field;
-            char *existing_local = NULL;
 
             if (!line || !*line)
                 continue; /* skip empty lines entirely */
@@ -489,26 +478,24 @@ static void barev_save_contact(BonjourBuddy *bb)
                 continue;
             }
 
-            existing_field = parts[0];
-
-            /* existing_field can be "nick" (new) or "nick@ip" (old) */
-            const char *at_old = strchr(existing_field, '@');
-            if (at_old && at_old != existing_field)
-                existing_local = g_strndup(existing_field,
-                                            (gsize)(at_old - existing_field));
-            else
-                existing_local = g_strdup(existing_field);
-
-            if (g_strcmp0(existing_local, localpart) == 0) {
-                /* Drop old record for this nick */
-                g_free(existing_local);
-                g_strfreev(parts);
-                continue;
+            char *existing_jid = NULL;
+            if (strchr(parts[0], '@') != NULL) {
+                /* New style: jid,ip,port */
+                existing_jid = g_strdup(parts[0]);
+            } else {
+                /* Old style: nick,ip,port -> reconstruct jid for comparison */
+                const char *existing_ip = (parts[1] && *parts[1]) ? parts[1] : "";
+                existing_jid = g_strdup_printf("%s@%s", parts[0], existing_ip);
             }
 
-            g_free(existing_local);
+            if (g_strcmp0(existing_jid, jid) == 0) {
+                g_free(existing_jid);
+                g_strfreev(parts);
+                continue; /* we'll write updated record at end */
+            }
 
-            /* Keep this line */
+            g_free(existing_jid);
+
             g_string_append(out, line_trimmed);
             g_string_append_c(out, '\n');
 
@@ -519,10 +506,8 @@ static void barev_save_contact(BonjourBuddy *bb)
         g_free(contents);
     }
 
-    /* Append our updated record in new format: "nick,ip,port" */
-    g_string_append_printf(out, "%s,%s,%d\n", localpart, ip ? ip : "", port);
-
-    g_free(localpart);
+    /* Append our updated record keyed by full buddy name (JID): "jid,ip,port" */
+    g_string_append_printf(out, "%s,%s,%d\n", jid, ip ? ip : "", port);
 
     /* Write back */
     g_file_set_contents(filename, out->str, out->len, NULL);
@@ -551,8 +536,6 @@ static void barev_remove_contact(PurpleAccount *account, const char *name)
         char *line = lines[i];
         char *line_trimmed;
         char **parts;
-        char *existing_localpart = NULL;
-        char *existing_jid = NULL;
 
         if (!line || !*line)
             continue;
@@ -567,58 +550,27 @@ static void barev_remove_contact(PurpleAccount *account, const char *name)
             continue;
         }
 
-        /* Parse the first field which could be either:
-         * - New format: "nick" (just localpart)
-         * - Old format: "nick@ip" (full JID)
+        /* Determine the buddy id on this line and remove only an exact match. */
+        char *existing_id = NULL;
+
+        /* New format: "jid,ip,port" (jid contains '@').
+         * Old format: "nick,ip,port" (no '@') -> rebuild as "nick@ip" for matching.
          */
-        existing_jid = parts[0];
-
-        /* Extract localpart from existing_jid */
-        const char *at_pos = strchr(existing_jid, '@');
-        if (at_pos) {
-            /* Old format: "nick@ip" - extract just the nick */
-            existing_localpart = g_strndup(existing_jid, (gsize)(at_pos - existing_jid));
+        if (parts[0] && strchr(parts[0], '@') != NULL) {
+            existing_id = g_strdup(parts[0]);
         } else {
-            /* New format: "nick" - use as is */
-            existing_localpart = g_strdup(existing_jid);
+            const char *existing_ip = (parts[1] && *parts[1]) ? parts[1] : "";
+            existing_id = g_strdup_printf("%s@%s", parts[0] ? parts[0] : "", existing_ip);
         }
 
-        /* Also extract localpart from the name we're trying to remove */
-        char *name_localpart = NULL;
-        const char *name_at = strchr(name, '@');
-        if (name_at) {
-            name_localpart = g_strndup(name, (gsize)(name_at - name));
-        } else {
-            name_localpart = g_strdup(name);
-        }
-
-        /* Check if we should remove this line by comparing:
-         * 1. Full JID vs full JID (for old format)
-         * 2. Localpart vs localpart (for new format)
-         */
-        gboolean should_remove = FALSE;
-
-        if (g_strcmp0(existing_jid, name) == 0) {
-            /* Exact match on full JID (old format) */
-            should_remove = TRUE;
-            purple_debug_info("bonjour", "Removing contact (full JID match): %s == %s\n",
-                             existing_jid, name);
-        } else if (existing_localpart && name_localpart &&
-                   g_strcmp0(existing_localpart, name_localpart) == 0) {
-            /* Match on localpart (new format) */
-            should_remove = TRUE;
-            purple_debug_info("bonjour", "Removing contact (localpart match): %s == %s\n",
-                             existing_localpart, name_localpart);
-        }
-
-        g_free(existing_localpart);
-        g_free(name_localpart);
-
-        if (should_remove) {
+        if (g_strcmp0(existing_id, name) == 0) {
             /* skip this one (delete) */
+            g_free(existing_id);
             g_strfreev(parts);
             continue;
         }
+
+        g_free(existing_id);
 
         g_string_append(out, line_trimmed);
         g_string_append_c(out, '\n');
